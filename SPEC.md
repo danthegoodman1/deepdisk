@@ -24,6 +24,16 @@ The host is what needs coordinating. Upload bandwidth, cache device capacity and
 
 Workers serve I/O with no dependency on the supervisor being alive. A dead supervisor means no new control operations and no rebalancing, while every attached volume keeps serving. Each worker also exposes the same per volume API on its own socket, so a volume stays drivable while the supervisor is down.
 
+### Reconciliation
+
+The supervisor holds no durable state. It rebuilds its whole view on startup from the kernel and from the workers themselves.
+
+`flock` on `/run/deepdisk/supervisor.lock` keeps it a singleton, and the kernel releases that lock on process death however the death happens. Attached volumes come from the ublk devices the kernel already knows about, each of which reports the pid of the process serving it, and workers bind a socket per volume at `/run/deepdisk/volumes/{uuid}.sock`. The supervisor connects to each, reads `SO_PEERCRED`, and requires the peer pid to match the one the kernel names as that device's server, which settles identity across a pid reuse.
+
+A live worker is adopted as it stands, with its device untouched. A device whose worker is gone sits in recovery pending, and the supervisor starts a replacement that reattaches through user recovery, leaving the device and the filesystem above it in place. Leases are then reissued from the aggregate: each worker reports what it currently holds, the supervisor sums them and redistributes. Leases carry an expiry, so a supervisor absent for longer than one finds every worker already decayed to its fixed share and can allocate freely.
+
+Workers are spawned detached and outlive the supervisor that started them. The gap this leaves is a worker crashing while the supervisor is down, which holds that one volume in recovery pending until the supervisor returns.
+
 ### Control API
 
 HTTP and JSON over a unix socket at `/run/deepdisk/control.sock`, guarded by filesystem permissions, since these calls create and destroy volumes.
