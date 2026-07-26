@@ -53,11 +53,11 @@ POST   /v1/volumes/{id}/compact          -> { job }
 GET    /v1/jobs/{id}
 ```
 
-`flush` is the call to get right. It commits an epoch and returns its number, and if nothing is dirty it returns the current epoch immediately with `noop: true` rather than erroring or writing an empty commit, so calling it defensively is free. Concurrent calls coalesce onto one commit and all return the same epoch, which makes it safe to call from several places at once. An explicit flush also bypasses the ~1/s root write rate limit, since the caller is asking for a durability point rather than producing one incidentally. `wait=false` returns as soon as the epoch is assigned, to be paired with `await`.
+`flush` is the call to get right. It commits an epoch and returns its number, and if nothing is dirty it returns the current epoch immediately with `noop: true`, so calling it defensively is free. Concurrent calls coalesce onto one commit and all return the same epoch, which makes it safe to call from several places at once. An explicit flush bypasses the ~1/s root write rate limit, since the caller is asking for a durability point directly. `wait=false` returns as soon as the epoch is assigned, to be paired with `await`.
 
-Clone is a copied root, so it is O(1) and needs no worker at all, just the supervisor copying one object under a new prefix. Cloning from `"now"` implies a flush first, cloning from a snapshot or an explicit epoch does not. A fork is a clone that is attached rather than left cold, which is the same primitive with one more step.
+Clone is a copied root, so it is O(1) and needs no worker at all, just the supervisor copying one object under a new prefix. Cloning from `"now"` implies a flush first, cloning from a snapshot or an explicit epoch does not. A fork is a clone that is attached.
 
-Rollback requires the volume to be detached. Selecting an older root underneath a live device would leave the page cache and the filesystem above holding state from an epoch that no longer exists, and there is no way to recover from that in the layers that would notice, so the API refuses it rather than making it the caller's problem.
+Rollback requires the volume to be detached. Selecting an older root underneath a live device leaves the page cache and the filesystem above holding state from an epoch that no longer exists, so the API refuses it.
 
 ## Block caching
 
@@ -77,9 +77,9 @@ The rules follow this:
 
 ### Cache layout
 
-The cache is a raw block device or partition, not a file on a filesystem. A file would put a second allocator, a second journal and a second set of flush semantics underneath ours, all of which we would then be paying for and reasoning about on every write.
+The cache is a raw block device or partition, so DeepDisk owns allocation, journaling and flush semantics all the way down to the hardware.
 
-Space is allocated in granules rather than blocks, 64KB by default, because a per block map does not fit: 1TB of cache is 256M blocks, and even a 10 byte entry is 2.5GB of RAM to address it. At 64KB it is 16M entries and ~160MB. Dirty state is still tracked per block inside the granule as a 16 bit mask, so coarse allocation never costs write amplification to the remote, and only the read that fills a granule is coarse.
+Space is allocated in 64KB granules, 16 blocks at 4K, which keeps the map for 1TB of cache at 16M entries and ~160MB of RAM. Dirty state is still tracked per block inside the granule as a 16 bit mask, so coarse allocation costs no write amplification to the remote, and only the read that fills a granule is coarse.
 
 DeepDisk advertises a volatile write cache, so a write is acknowledged once it is in memory and only has to reach disk on `REQ_OP_FLUSH` or `REQ_FUA`. That is the same contract as any disk with a write cache, and it means the metadata cost below is paid once per barrier rather than once per write.
 
@@ -163,7 +163,7 @@ Per block entries do not scale. At 6 bytes each, 1TB of 4K blocks is 1.5GB, and 
 
 The index is a radix tree over the block index. Block indices are dense integers, so there are no comparisons and no rebalancing, and unwritten regions are simply absent. That last property matters for a bottomless device, where most of the address space was never touched: a read of a never written block returns zeros with no I/O and costs nothing in the map.
 
-Pages are not fixed size, since object storage does not require it. A page serializes to whatever its encoding needs and its parent records the length.
+Pages are variable size. A page serializes to whatever its encoding needs and its parent records the length.
 
 Interior entries are 11 bytes, `(index u8, pack u32, offset u32, len u16)`, so a fanout of 256 is 2816 bytes. Entries are locations rather than hashes, so an unchanged child is never rewritten and keeps pointing into whatever older pack it already lives in.
 
@@ -178,7 +178,7 @@ A leaf covers 4096 blocks, 16MB of address space at 4K, and picks its encoding:
 
 The tree is copy on write. The flusher builds new pages for the paths it touches and swaps the root with a release store, so readers take the root pointer and traverse an immutable snapshot with no locks on the read path at all. A block device has a single writer, so this needs no further coordination. Old pages are reclaimed once no reader holds them.
 
-Pages are packed rather than written individually. 65k tiny leaf objects would be a terrible object to byte ratio, so a checkpoint concatenates all of its dirty pages into one pack object and uploads it once, making a checkpoint 1-2 puts no matter how many pages changed.
+Pages are packed. A checkpoint concatenates all of its dirty pages into one pack object and uploads it once, making a checkpoint 1-2 puts no matter how many pages changed, and keeping the object to byte ratio sane across 65k leaves.
 
 Within a pack, interior pages are serialized first and in tree order, ahead of the leaves. Nothing else constrains their placement, so without this the quality of a bulk interior load is accidental. Writing them contiguously and in level order turns loading the whole interior into a handful of near sequential range reads, and it compounds with locality aware compaction below.
 
@@ -264,7 +264,7 @@ DELETE meta/delta/M+1 .. N
 drop the overlay
 ```
 
-Folding at the checkpoint is where leaves are loaded, and doing it in one batch means the loads coalesce across the whole interval instead of arriving a scattered handful at a time every 10s.
+Folding at the checkpoint is where leaves are loaded, and doing it in one batch coalesces those loads across the whole interval.
 
 Mount:
 
@@ -281,13 +281,13 @@ background:
   leaves faulted in on demand
 ```
 
-The overlay is a flat in memory map of block index to segment + slot, holding every epoch committed since the last checkpoint and consulted before descending the tree. It is not a mount artifact, it is how the map is maintained at all times, and mount simply rebuilds it by replaying the deltas that the running writer would have had in memory. Any lookup checks the overlay, then walks the tree, faulting what is missing. It is bounded by the checkpoint interval at ~1M entries, around 10MB, and is dropped once folded in.
+The overlay is a flat in memory map of block index to segment + slot, holding every epoch committed since the last checkpoint and consulted before descending the tree. It is how the map is maintained at all times, and mount rebuilds it by replaying the deltas the running writer holds in memory. Any lookup checks the overlay, then walks the tree, faulting what is missing. It is bounded by the checkpoint interval at ~1M entries, around 10MB, and is dropped once folded in.
 
 Interior pages are pinned rather than faulted. They are few and small, ~724KB for 1TB as a root plus 256 interior pages and ~72MB for 100TB written, so holding all of them costs nothing next to the volume they describe and makes every cold lookup exactly one fetch, the leaf. Note this scales with written data rather than presented capacity, so a bottomless volume showing 100TB with 10TB written is ~7MB. The crossover where this stops being free is closer to 1PB written, at ~720MB.
 
-They are pulled in the background rather than blocking the mount, and a lookup that arrives before its interior page does simply faults it. The load is breadth first and bulk rather than page at a time: once a level is parsed we hold every `(pack, offset, len)` for the level below, so those pointers are sorted by pack and offset and coalesced into large range reads, merging any two separated by less than ~64KB since reading junk bytes is far cheaper than a second request. That is three dependent rounds, since a level's locations are unknown until its parent is parsed, and tens of requests against the 25,701 a page at a time walk would issue, or ~700ms on 1Gbps against roughly 13s. It is also a cold host cost only, since the tree is materialized on local disk and a remount reads the same 72MB from NVMe in ~35ms.
+They are pulled in the background rather than blocking the mount, and a lookup that arrives before its interior page does simply faults it. The load is breadth first and bulk rather than page at a time: once a level is parsed we hold every `(pack, offset, len)` for the level below, so those pointers are sorted by pack and offset and coalesced into large range reads, merging any two separated by less than ~64KB since reading junk bytes is far cheaper than a second request. That is three dependent rounds, since a level's locations are unknown until its parent is parsed, and tens of requests, or ~700ms on 1Gbps. It is also a cold host cost only, since the tree is materialized on local disk and a remount reads the same 72MB from NVMe in ~35ms.
 
-Loading only the interior is the policy for a large tree, not always the right one. The checkpoint records the total serialized size of the tree in the root as `tree_bytes`, and below a threshold, say 256MB, we load all of it including leaves; a sequentially written 1TB volume is around 1MB in total, and pulling that in one range read means no metadata request ever reaches the read path rather than one per region. Above the threshold a faulting leaf widens its fetch to its neighbors in the same pack, which are the leaves for regions written at the same time, so the extra bytes are nearly free next to the request already being made. This is the same reasoning that makes contiguous packing worthwhile for data segments.
+Loading only the interior is the policy for a large tree. The checkpoint records the total serialized size of the tree in the root as `tree_bytes`, and below a threshold, say 256MB, we load all of it including leaves; a sequentially written 1TB volume is around 1MB in total, and pulling that in one range read means no metadata request ever reaches the read path. Above the threshold a faulting leaf widens its fetch to its neighbors in the same pack, which are the leaves for regions written at the same time, so the extra bytes are nearly free next to the request already being made. This is the same reasoning that makes contiguous packing worthwhile for data segments.
 
 Index pages can be faulted in lazily, but deltas cannot, because we cannot know which of them supersede a page we have not fetched yet. So the delta count between checkpoints is what sets mount latency, and it is the reason to bound it at ~1000 rather than letting the stream grow to the ~260k objects a month of 10s epochs would produce.
 
@@ -312,9 +312,9 @@ Snapshots complicate this, because the counter only tracks the current root whil
 
 `REQ_OP_DISCARD` unmaps rather than writes. The manifest entry is removed, the local cache granule is freed, and the segment that held the data has its live counter decremented through the same reverse mapping path an overwrite uses. `logical_bytes` drops immediately, `physical_bytes` only when those segments are compacted.
 
-Because an absent entry already reads as zeros, DeepDisk can honestly report that discarded blocks return zeros deterministically. That is worth advertising, since it lets the filesystem skip zeroing ranges it has just released, and it makes `REQ_OP_WRITE_ZEROES` the same operation as discard rather than a write of real zeros.
+Because an absent entry already reads as zeros, DeepDisk can honestly report that discarded blocks return zeros deterministically. That is worth advertising, since it lets the filesystem skip zeroing ranges it has just released, and it makes `REQ_OP_WRITE_ZEROES` the same operation as discard.
 
-Discards arrive in floods, since `fstrim` releases everything a filesystem is not using in a single pass, so they have to be range operations. This is where the radix tree pays off a second time: unmapping a large range drops whole leaves and whole interior entries rather than clearing entries one at a time, so the cost is proportional to the tree nodes the range spans rather than to the blocks in it, and a discard covering an entire subtree is one entry removed from its parent.
+Discards arrive in floods, since `fstrim` releases everything a filesystem is not using in a single pass, so they have to be range operations. This is where the radix tree pays off a second time: unmapping a large range drops whole leaves and whole interior entries, so the cost is proportional to the tree nodes the range spans and not to the blocks in it, and a discard covering an entire subtree is one entry removed from its parent.
 
 Unmapping commits like a write, as an entry in the epoch delta, so a discard is durable only once its epoch commits and is never visible remotely ahead of the root that records it.
 
@@ -322,9 +322,9 @@ Unmapping commits like a write, as an entry in the epoch delta, so a discard is 
 
 Reads and writes fail differently, because the truth is in different places. A write is durable locally the moment its barrier completes, so an unreachable remote costs us space rather than data, and the response is to accumulate dirty blocks and walk up the watermarks. A read that misses the local cache has no local truth to fall back on, so for it an unreachable remote is a real failure.
 
-A missing read retries with backoff against a deadline, 60s by default, then returns `EIO`. Retrying forever would park the caller in uninterruptible sleep and take the filesystem with it, which is indistinguishable from a hang and cannot be diagnosed from above. The deadline is generous because most outages are shorter than it and an `EIO` is expensive, often a read only remount.
+A missing read retries with backoff against a deadline, 60s by default, then returns `EIO`, which surfaces an error the layers above can report and act on. The deadline is generous because most outages are shorter than it and an `EIO` is expensive, often a read only remount.
 
-The write side has the same question at the top of the watermark ladder, and the default is the opposite. The stall is held indefinitely, because the data is already durable and the workload is only being asked to wait, so the outage costs latency rather than integrity. A deadline after which writes take `EIO` is available for workloads that would rather fail than block, but it is not the default: the read case fails by necessity, the write case would be failing by choice.
+At the top of the watermark ladder the stall is held indefinitely, because the data is already durable and the workload is only being asked to wait, so the outage costs latency and leaves integrity intact. A deadline after which writes take `EIO` is available as policy for workloads that prefer to fail fast.
 
 ## Open questions
 
