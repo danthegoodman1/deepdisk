@@ -43,7 +43,7 @@ Dirty blocks are flushed for a number of reasons:
 
 A block written in the last ~1s is held back from a segment being packed, to absorb repeated overwrites. This is only an optimization to avoid redundant uploads, never a reason to defer one, so the age cap, dirty pressure, idle, shutdown and checkpoint all override it.
 
-When selecting which dirty blocks to pack into a segment, we prefer spatially adjacent blocks. A read fault fetches a whole segment, so contiguous packing turns that fetch into a useful prefetch.
+When selecting which dirty blocks to pack into a segment, we prefer spatially adjacent blocks. A read fault range gets only the blocks it needs, at the same request cost as fetching the whole segment, so contiguous packing is what makes widening that range into a prefetch worth doing rather than pulling in unrelated blocks.
 
 #### Watermarks
 
@@ -81,10 +81,6 @@ That gives us, with no extra machinery:
 1. Snapshots, which are a pinned root. Nothing is copied and nothing moves, so taking one is O(1)
 2. Rollback, which is selecting an older root
 3. Clones, which are a copied root. Both volumes share every existing segment and only diverge as they are written to
-
-Versioning here is our own, via epoch named objects. S3 object versioning is per object and gives no coherent point in time across objects, which is the entire property we want.
-
-Two limits to be clear about. A snapshot captures remote state, so one that is meant to include current writes has to close an epoch first, then pin. And granularity is the epoch, so values a block held between two epochs are coalesced away and cannot be recovered. This is not continuous data protection.
 
 #### Failure and garbage
 
