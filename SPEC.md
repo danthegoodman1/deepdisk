@@ -134,16 +134,16 @@ Uploading lazily and out of order leaves the remote copy torn across many points
 
 1. Segments are uploaded as soon as they seal, in any order
 2. A delta, listing block index -> segment + offset for only the blocks that moved this epoch, is uploaded under the epoch number
-3. A small root object recording the latest committed epoch is written. This is the atomic commit, and the durability point
+3. A root object is written for the epoch and the head is swapped to point at it. That swap is the atomic commit, and the durability point
 4. Only then are those blocks marked clean in the dirty bitmap, making them evictable
 
-Segments are immutable, and an uploaded segment is invisible until a committed root references it. This is what keeps the remote path off the critical path: uploads can be issued the moment a segment seals, need no ordering between them, and can be retried in any order, because the only step that has to be ordered is the small metadata write at the end. A partially uploaded epoch is harmless, as nothing ever refers to it.
+Segments are immutable, and an uploaded segment is invisible until the head names a root that references it. This is what keeps the remote path off the critical path: uploads can be issued the moment a segment seals, need no ordering between them, and can be retried in any order, because the only step that has to be ordered is the small metadata write at the end. A partially uploaded epoch is harmless, as nothing ever refers to it.
 
 The delta is proportional to the data it describes rather than to the size of the device, so committing stays cheap no matter how large the volume is. It should encode to little: the segment ID is constant across the entries and belongs in a header, the offset is implicit if entries are in segment slot order, which leaves only the block indices, and those are runs of consecutive values whenever packing was contiguous. A full 4MB segment is a few hundred bytes as extents, up to ~4KB for a random scatter.
 
 The index that these deltas apply to is checkpointed periodically, so recovery is the newest checkpoint plus the deltas since it rather than the entire history. See Manifest below.
 
-Recovery always restores the last committed root. Filesystem flush/FUA barriers are used as epoch boundaries where they land, since they mark points the filesystem itself considers consistent, and a barrier only costs a delta and a root write. Otherwise the epoch is cut on the age cap. Root writes are rate limited to ~1/s so a bursty workload cannot commit continuously, and use a conditional put, see Fencing below.
+Recovery always restores the last committed root. Filesystem flush/FUA barriers are used as epoch boundaries where they land, since they mark points the filesystem itself considers consistent, and a barrier only costs a delta and a root write. Otherwise the epoch is cut on the age cap. Commits are rate limited to ~1/s so a bursty workload cannot commit continuously, and the head swap is conditional, see Fencing below.
 
 #### Snapshots and clones
 
@@ -165,7 +165,7 @@ Because the remote is copy-on-write, overwriting a block leaves the old value in
 
 The manifest maps block index to segment + slot. There are two separate maps and this is the cold one: the local cache map (block index -> cache slot, dirty, heat) is consulted on every I/O and has to be fast, while the manifest is only consulted on a local cache miss, at which point we are already committed to a 20-100ms network fetch. A lookup taking microseconds is free in that context, so the manifest is optimized for size rather than latency.
 
-It is a write ahead log plus a periodically checkpointed index. The merged view is always materialized locally, and deltas are read only during mount. Writing index pages every epoch would amplify badly, since one scattered entry dirties a leaf plus its whole path to the root, so instead each epoch appends a small delta and the dirty pages accumulate in memory until a checkpoint makes them durable.
+It is a write ahead log plus a periodically checkpointed index. The merged view is always materialized locally, and the log is read only during mount. Writing index pages every epoch would amplify badly, since one scattered entry dirties a leaf plus its whole path to the root, so instead each epoch appends a small delta and the dirty pages accumulate in memory until a checkpoint makes them durable.
 
 ### Structure
 
@@ -261,6 +261,8 @@ The gap between the last two is the garbage ratio, so compaction can be schedule
 
 ### Loops
 
+One root is written per epoch and one head swap commits it. The two loops below are extra work that rides on an epoch commit, never a second commit of their own.
+
 Every epoch, around 10s, which is three small puts plus the segment and no index pages:
 
 ```
@@ -274,15 +276,14 @@ mark blocks clean
 
 An epoch never touches the tree. Applying to leaves instead would require them to be resident, so a write to a cold region would fault its leaf from the remote purely to overwrite entries in it, and that fetch would sit between the commit and marking blocks clean. Remote metadata latency would then feed straight into local dirty pressure and could throttle writes over metadata rather than data. The delta is the durable record and the tree is derived, so the tree is only updated when it is convenient to do so.
 
-Every ~1000 epochs, around 3h:
+Every ~1000 epochs, around 3h, that commit does more before its delta, and its root names the new tree:
 
 ```
 fold the overlay into leaves    faults only the leaves it touches, batched
 serialize pages dirtied since the last checkpoint -> one pack
 PUT meta/pack/K
-PUT meta/root/N             { epoch: N, tree: (K, off, len), delta_from: N+1 }
-CAS meta/head               { epoch: N }
-DELETE meta/delta/M+1 .. N  except where a retained root still needs them
+   ...root for this epoch carries tree: (K, off, len), delta_from: N+1
+DELETE meta/delta/M+1 .. N      except where a retained root still needs them
 drop the overlay
 ```
 
@@ -290,11 +291,11 @@ Folding at the checkpoint is where leaves are loaded, and doing it in one batch 
 
 A root between checkpoints carries a tree from the last checkpoint plus a delta range, so it is only readable while those deltas exist. Retaining a root therefore retains its delta range, and the checkpoint skips any delta a retained root still spans. That is what makes a snapshot at an arbitrary epoch a real image rather than a pointer that stops resolving at the next checkpoint, and it is cheap, since a retained interval is ~1000 objects at ~1KB.
 
-Every ~100 epochs, around 15 minutes:
+Every ~100 epochs, around 15 minutes, that commit carries one extra put:
 
 ```
 PUT meta/merged/N           the overlay serialized as it stands
-PUT meta/root/N             { ..., merged_from: N, delta_from: N+1 }
+   ...root for this epoch carries merged_from: N, delta_from: N+1
 ```
 
 The overlay already holds the merged view of every delta since the last checkpoint, so writing it out costs one put and reads nothing. A merge exists to keep the delta stream short for whoever mounts next, which is a different concern from folding the tree and wants a different frequency: the tree checkpoint is paced by how much leaf rewriting is worth doing, a merge by how long a cold mount is allowed to take. It uses the same extent encoding as a delta, so it is ~1 byte per entry and reaches ~1MB by the end of a checkpoint interval, against the ~10MB the same map costs in memory. Each one rewrites content the previous already wrote, ~5.5MB across the interval, which is small enough to ignore.
