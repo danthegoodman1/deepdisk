@@ -80,7 +80,7 @@ GET    /v1/jobs/{id}
 
 `flush` is the call to get right. It commits an epoch and returns its number, and if nothing is dirty it returns the current epoch immediately with `noop: true`, so calling it defensively is free. Concurrent calls coalesce onto one commit and all return the same epoch, which makes it safe to call from several places at once. An explicit flush bypasses the ~1/s root write rate limit, since the caller is asking for a durability point directly. `wait=false` returns as soon as the epoch is assigned, to be paired with `await`.
 
-Clone is a copied root, so it is O(1) and needs no worker at all, just the supervisor copying one object under a new prefix. Cloning from `"now"` implies a flush first, cloning from a snapshot or an explicit epoch does not. A fork is a clone that is attached.
+Clone is a copied root, so it is O(1) and needs no worker at all, just the supervisor copying that object and `meta/heat` under a new prefix, the second so the clone starts warm instead of relearning what the source already knows. Cloning from `"now"` implies a flush first, cloning from a snapshot or an explicit epoch does not. A fork is a clone that is attached.
 
 Rollback requires the volume to be detached. Repointing the tree underneath a live device leaves the page cache and the filesystem above holding state from a tree that no longer describes the volume, so the API refuses it.
 
