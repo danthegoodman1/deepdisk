@@ -151,8 +151,8 @@ Immutable segments plus a versioned root make the remote copy-on-write. A write 
 
 That gives us, with no extra machinery:
 
-1. Snapshots, which are a pinned root. Nothing is copied and nothing moves, so taking one is O(1)
-2. Rollback, which commits a new epoch pointing at an older tree
+1. Snapshots, which mark a root as retained along with the delta range it spans. Nothing is copied and nothing moves, so taking one is O(1)
+2. Rollback, which commits a new epoch pointing at an older root, reaching any epoch still retained
 3. Clones, which are a copied root. Both volumes share every existing segment and only diverge as they are written to
 
 #### Failure and garbage
@@ -198,7 +198,7 @@ Packs accumulate dead pages as those pages are superseded, so packs need livenes
 
 ### Layout
 
-Three object classes, and the root is the only mutable one:
+Everything is immutable except `meta/head`:
 
 ```
 data/seg/000000A1F3              4MB immutable segment, self describing
@@ -216,7 +216,7 @@ orphan/42847/3f2ab19c/           a fenced writer's last writes, root and segment
 
 meta/super                       { uuid, format_version, block_bytes: 4096 }
 
-meta/root                        { epoch: 42847,
+meta/root/0000000000042847       { epoch: 42847,
                                    writer_id: "3f2ab19c",
                                    tree: (pack 13, off 8192, len 3400),
                                    tree_bytes: 1046528,
@@ -225,7 +225,11 @@ meta/root                        { epoch: 42847,
                                    device_bytes: 109951162777600,
                                    logical_bytes: 8246337208320,
                                    physical_bytes: 11338713397657 }
+
+meta/head                        { epoch: 42847 }
 ```
+
+Roots are immutable and written one per epoch, and `meta/head` is the only mutable object in the volume. Committing is a create of the root followed by a compare and swap of the head, so the head is what fencing contends on and it stays small enough that the check is a few bytes. Every epoch that ever committed is still addressable, which is what rollback and point in time recovery reach for.
 
 Keys are deterministic, and the root records the current checkpoint plus the live delta range, so we never list a prefix to find objects. Listing is only for garbage collection and repair.
 
@@ -254,13 +258,14 @@ The gap between the last two is the garbage ratio, so compaction can be schedule
 
 ### Loops
 
-Every epoch, around 10s, which is two small puts plus the segment and no index pages:
+Every epoch, around 10s, which is three small puts plus the segment and no index pages:
 
 ```
 PUT data/seg/...            the segment
 apply to the overlay        in memory, no leaves touched
 PUT meta/delta/N            the delta
-PUT meta/root               { epoch: N, tree: <unchanged>, delta_from: M+1 }
+PUT meta/root/N             { epoch: N, tree: <unchanged>, delta_from: M+1 }
+CAS meta/head               { epoch: N } if it still holds N-1
 mark blocks clean
 ```
 
@@ -272,17 +277,20 @@ Every ~1000 epochs, around 3h:
 fold the overlay into leaves    faults only the leaves it touches, batched
 serialize pages dirtied since the last checkpoint -> one pack
 PUT meta/pack/K
-PUT meta/root               { epoch: N, tree: (K, off, len), delta_from: N+1 }
-DELETE meta/delta/M+1 .. N
+PUT meta/root/N             { epoch: N, tree: (K, off, len), delta_from: N+1 }
+CAS meta/head               { epoch: N }
+DELETE meta/delta/M+1 .. N  except where a retained root still needs them
 drop the overlay
 ```
 
 Folding at the checkpoint is where leaves are loaded, and doing it in one batch coalesces those loads across the whole interval.
 
+A root between checkpoints carries a tree from the last checkpoint plus a delta range, so it is only readable while those deltas exist. Retaining a root therefore retains its delta range, and the checkpoint skips any delta a retained root still spans. That is what makes a snapshot at an arbitrary epoch a real image rather than a pointer that stops resolving at the next checkpoint, and it is cheap, since a retained interval is ~1000 objects at ~1KB.
+
 Mount:
 
 ```
-GET meta/root
+GET meta/head then meta/root/{epoch}   two small sequential gets
 GET the root page                      range get into its pack
 GET meta/delta/{delta_from..epoch}     in parallel, ~1000 objects, sub-second
 replay them into an overlay
@@ -343,11 +351,11 @@ At the top of the watermark ladder the stall is held indefinitely, because the d
 
 Running one writer is the application's guarantee to make, and it is the operational requirement DeepDisk places on whoever deploys it. What follows detects a second writer and contains it. It does not make concurrent mounts work, and it does not recover what the second writer costs, so an orchestrator that fails over on unreachability alone will eventually lose data here. Unreachable and dead are different states, and only the deployment can tell them apart.
 
-Fencing lives entirely on the remote and the epoch is the token. Every root put is conditional on the root still holding the epoch this writer last committed, so two writers advancing from the same epoch resolve into one winner and one conditional failure. Every object beneath the root is a conditional create as well, since those keys are deterministic and a second writer computes them identically: both pack segment `A1F4` and both write `meta/delta/106`, so under last write wins the winner's committed epoch could point at the loser's bytes. An existing key means another writer has claimed it, which fences on the first object of an epoch rather than at the root put. A writer retrying its own upload reads the header back and finds its own `writer_id`.
+Fencing lives entirely on the remote and the epoch is the token. Every head swap is conditional on the head still holding the epoch this writer last committed, so two writers advancing from the same epoch resolve into one winner and one conditional failure. Every object beneath the head is a conditional create as well, since those keys are deterministic and a second writer computes them identically: both pack segment `A1F4` and both write `meta/delta/106`, so under last write wins the winner's committed epoch could point at the loser's bytes. An existing key means another writer has claimed it, which fences on the first object of an epoch rather than at the root put. A writer retrying its own upload reads the header back and finds its own `writer_id`.
 
-The loser holds an invalid copy. Not a stale one that could be caught up and not a divergent one that could be merged, since its blocks were written against allocation state the winner never saw. So it flushes its dirty blocks to `orphan/{epoch}/{writer_id}/`, fails outstanding and subsequent I/O with `EIO`, and drops the mount, and it never re-reads the root to retry from the newer epoch, which is the one step that would turn a fence back into a race. That prefix holds a private root and its segments, so an operator can clone it into a separate volume and pull files out by hand. It is never applied onto the winner.
+The loser holds an invalid copy. Not a stale one that could be caught up and not a divergent one that could be merged, since its blocks were written against allocation state the winner never saw. So it flushes its dirty blocks to `orphan/{epoch}/{writer_id}/`, fails outstanding and subsequent I/O with `EIO`, and drops the mount, and it never re-reads the root to retry from the newer epoch, which is the one step that would turn a fence back into a race. That prefix holds a private root and its segments, so an operator can clone it into a separate volume and pull files out by hand. It is never applied onto the winner. Garbage collection also never touches it, since its liveness rules would read an unreferenced root as dead, so the prefix stays until an operator removes it and a split brain leaves a trace that does not expire on its own.
 
-The same rule runs at mount, since a writer can be fenced and then crash before acting on it. An ordinary restart keeps its cache, because the dirty blocks there are acknowledged writes that have not been uploaded, so one number separates the two cases: the cache superblock records the epoch it is working toward, written before the root put, which holds it at or ahead of the root for a legitimate writer even when a crash lands between them. A root ahead of the cache means another writer committed, and the whole cache is orphaned and dropped, since entries are keyed by block index and the winner may have rewritten any of them. This depends on a strictly monotonic epoch, so rollback commits forward, writing a new epoch whose tree points at older content.
+The same rule runs at mount, since a writer can be fenced and then crash before acting on it. An ordinary restart keeps its cache, because the dirty blocks there are acknowledged writes that have not been uploaded, so one number separates the two cases: the cache superblock records the epoch it is working toward, written before the root put, which holds it at or ahead of the root for a legitimate writer even when a crash lands between them. A head ahead of the cache means another writer committed, and the whole cache is orphaned and dropped, since entries are keyed by block index and the winner may have rewritten any of them. This depends on a strictly monotonic epoch, so rollback commits forward, writing a new epoch whose tree points at older content.
 
 This protects the integrity of the remote. Two writers can never produce a torn or interleaved image, and a zombie serving reads mutates nothing. The flush window is separate: the writes the loser acknowledged and had not yet uploaded are unreachable from the winner, so split brain converts the age cap from an RPO window into a data loss window and one knob bounds both. Surviving a host means uploading, and fencing is orthogonal to it.
 
@@ -355,11 +363,8 @@ Conditional put is a hard backend requirement. S3, GCS, Azure and R2 all expose 
 
 ## Open questions
 
-1. Garbage collection is sketched rather than designed. There is no policy for the garbage ratio that should trigger it, no bandwidth budget, and no defined interaction with the watermarks, which matters because compaction competes with flushing for the same upload capacity
+1. Garbage collection is sketched rather than designed. The supervisor leases compaction budget across volumes, but there is no policy for the garbage ratio that should trigger a pass, and no rule for how compaction yields to flushing inside one volume as dirty pressure climbs
 2. Snapshot liveness is a union across retained roots, fine for a handful and expensive at hundreds. Liveness may need to be tracked per snapshot, or snapshot count may need a bound
-3. Leaf size is fixed at 4096 blocks. A dense leaf is 24KB, so a checkpoint over a badly fragmented region writes far more bytes than the entries that changed, roughly 6x. It should probably be tunable, and the dense threshold may want to split a leaf rather than densify it
-4. Putting the manifest in a key value store rather than object storage, FoundationDB in particular, is attractive for mount time and for the RPO floor that rate limiting root writes imposes, but a 24KB dense leaf exceeds its recommended value size
-5. Compression and encryption are unaddressed. Both belong at the segment boundary, which is also where they collide with range gets, since a read fault has to decrypt and decompress a slice rather than the whole object
-6. A single writer is assumed throughout. Nothing forbids a second host mounting a snapshot read only, but nothing establishes it either
-7. Orphan prefixes have no retention policy. They are outside the liveness rules that govern segments, since no retained root references them, so garbage collection needs to be told to leave them alone and something has to expire them
-8. Rollback names an older tree, and the only thing retaining old roots is a snapshot. Either roots become versioned objects with `meta/root` as a pointer to the live one, or rollback is defined to reach snapshots alone
+3. Leaf size is fixed at 4096 blocks, which makes a dense leaf 24KB, and that one number drives two costs. A checkpoint over a badly fragmented region writes roughly 6x the bytes that changed, and it rules out a key value backend like FoundationDB, which recommends values under ~10KB and would otherwise be attractive for mount time and for the RPO floor that rate limiting root writes imposes. Leaf size should be tunable, and the dense threshold may want to split a leaf rather than densify it
+4. Compression and encryption are unaddressed. Both belong at the segment boundary, which is also where they collide with range gets, since a read fault has to decrypt and decompress a slice rather than the whole object
+5. Roots and their deltas accumulate at one per epoch, so something has to expire them. A retention window bounds it, ~8,600 roots and deltas a day at 10s epochs, a few tens of MB, but the window and whether it is time or count based are unset
