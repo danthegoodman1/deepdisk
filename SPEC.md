@@ -6,6 +6,21 @@ It does this by using local disk as the durability boundary, while asynchronousl
 
 Because it is just a block device, that means the implementation can be simplified, and existing filesystems (ext4, xfs) can be used on top. Because there are no special filesystem rules, almost all Linux software will work out of the box on top, with the same performance a majority of the time.
 
+## Units
+
+```
+block     4KB           the addressable unit, what every map is keyed by
+granule   64KB          allocation and eviction unit of the local cache, 16 blocks
+segment   4-8MB         a remote object, what dirty blocks are packed into
+slot      one block     a block's position inside a segment
+extent    variable      a contiguous run of block indices, an encoding rather than storage
+leaf      4096 blocks   a manifest page, covering 16MB of address space
+pack      variable      a remote object holding manifest pages
+epoch     ~10s          one commit, the unit of remote durability
+```
+
+Granules are local and segments are remote, and the two never align: a granule holds whatever the cache decided to keep, a segment holds whatever happened to be dirty when a flush fired. Extents are the odd one out, since they are how a map writes down a run of blocks compactly rather than a unit anything is stored in.
+
 ## Device
 
 DeepDisk attaches as a `ublk` device, a userspace block driver that passes requests over `io_uring`, so the policy engine, the object store client and the TLS stack all live in a normal userspace process while the kernel sees a real block device. `nbd` is the fallback for kernels older than 6.0.
@@ -78,7 +93,7 @@ DeepDisk will keep well known blocks always locally cached (e.g. where filesyste
 2. Hot blocks
 3. Recently read blocks
 
-For the local cache, a block is marked dirty via a bitmap, where the bitmap indicates the offset index in the block device (e.g. for a 4k block size, block offset 8192 is index 2). A separate system that runs async to the hot path is used to classify hot vs recently read.
+For the local cache, a block is marked dirty via a bitmap, where the bitmap indicates the offset index in the block device (e.g. for a 4k block size, block offset 8192 is index 2). Those last two are the main and small queues below.
 
 The rules follow this:
 1. Dirty blocks will always evict recently read blocks, or hit blocks
@@ -94,6 +109,28 @@ Space is allocated in 64KB granules, 16 blocks at 4K, which keeps the map for 1T
 DeepDisk advertises a volatile write cache, so a write is acknowledged once it is in memory and only has to reach disk on `REQ_OP_FLUSH` or `REQ_FUA`. That is the same contract as any disk with a write cache, and it means the metadata cost below is paid once per barrier rather than once per write.
 
 Durability of the cache has the same shape as the manifest, a log plus a checkpoint, for the same reason. A barrier is not complete until both the data and enough metadata to find it again are on disk, so each one appends an intent record, `(granule, block mask, block index)` per granule touched, to a ring on the same device. The granule table is checkpointed periodically, and recovery is the last table plus the ring tail, which bounds recovery time by the ring size rather than by the size of the cache.
+
+### Heat and eviction
+
+Eviction is the three FIFO queue structure S3-FIFO describes, operating on granules. A small queue holds ~10% of capacity and everything enters there. A granule touched again while in small is promoted to main on its way out, and one that was never touched again leaves for a ghost queue holding its fingerprint and none of its data. A later hit on a ghost entry admits straight to main. Frequency is two bits.
+
+Scan resistance is why. A backup, a `grep -r` or an `updatedb` walks the whole volume once, and under recency that walk evicts the working set it passes over. Here it never leaves the small queue. FIFO also means the read path appends and never reorders a list, so it takes no lock and allocates nothing, which is what the writeback path requires.
+
+DeepDisk is a second level cache and sees the page cache's miss stream, already stripped of the short term reuse that recency exploits. Frequency based admission is the right shape for that, and it also means published hit rates for this family come from web and CDN traces and want measuring here rather than assuming.
+
+Sequential streams are detected separately, since the queues have no notion of them. A detected stream prefetches ahead and is admitted at low value, so a large read gets readahead without occupying main.
+
+State is three bits per granule, a two bit counter and a queue id, so it folds into the granule table. The ghost queue is the part to size deliberately: one fingerprint per evicted granule is 16M entries for 1TB of cache, and even 8 bytes each is ~128MB on top of the ~160MB table.
+
+Dirty granules are exempt, since they are pinned until uploaded. Replacement therefore governs only the clean portion of the cache, and that portion shrinks as dirty pressure climbs, so at the 85% watermark the policy is working with 15% of the device and hit rate degrades exactly when the system is already stressed. A write allocates unconditionally and joins the queues as a hit once its epoch commits.
+
+### Warm start
+
+Heat is checkpointed with the granule table, so a worker restart resumes with its working set intact. The cached data survives a restart on its own, and this is what keeps it findable as valuable, since a cache that comes back uniformly cold loses its working set to the first scan that follows.
+
+A host with no local cache at all, after a migration, a clone or cache loss, gets a summary instead. The hottest granule ranges are published periodically to `meta/heat/N`, extent encoded and capped at a fixed number of ranges, and a cold mount prefetches them in heat order while it serves. That is what lets a clone start warm rather than paying for every block twice.
+
+Prefetch runs in the background, yields to demand traffic, and draws on the same bandwidth the supervisor leases, so warming a new host never competes with a volume that is already serving.
 
 ### Flushing
 
@@ -127,6 +164,8 @@ As a fraction of the local cache occupied by dirty blocks:
 3. 60-85%, maximum upload concurrency, and the overwrite window is ignored
 4. Over 85%, incoming writes are throttled
 5. Over 95%, writes stall
+
+Dirty and clean share one device, so this ladder is also what reserves space for the read cache: the stall at 95% is the floor that keeps a clean portion at all. Tuning these for flush behaviour tunes read hit rate at the same time.
 
 #### Epochs
 
@@ -214,6 +253,8 @@ meta/delta/0000000000042847
 
 meta/merged/0000000000042800     the overlay serialized, one per ~100 epochs
 
+meta/heat/0000000000042800       hottest granule ranges, for a cold host to prefetch
+
 orphan/42847/3f2ab19c/           a fenced writer's last writes, root and segments
 
 meta/super                       { uuid, format_version, block_bytes: 4096 }
@@ -242,9 +283,9 @@ The root carries the sizes because they change with the epoch and have to be ato
 
 1. `device_bytes`, the capacity presented to Linux. Keeping it here makes an online grow a normal epoch commit rather than separate mutable state that can disagree with the manifest, and it means a volume mounted on another host needs nothing out of band. It must never shrink below the highest mapped block
 2. `logical_bytes`, the address space actually written. This is the thin provisioned used figure, and is what a bottomless device reports as consumed rather than `device_bytes`
-3. `physical_bytes`, live bytes across segments, which is what the remote is actually being billed for
+3. `physical_bytes`, total bytes stored remotely, garbage and metadata objects included. This is the bill, so it counts dead regions inside segments right up until compaction reclaims them, and it counts packs, deltas and merges
 
-The gap between the last two is the garbage ratio, so compaction can be scheduled from two numbers in the root without scanning segments or walking the tree. All three are maintained incrementally, since recomputing them means a full scan.
+The gap between the last two is what deferring compaction costs, so a pass can be scheduled from two numbers in the root without scanning segments or walking the tree. All three are maintained incrementally, since recomputing them means a full scan.
 
 ```
                         root page          (pack 13)
@@ -382,3 +423,5 @@ Conditional put is a hard backend requirement. S3, GCS, Azure and R2 all expose 
 3. Leaf size is fixed at 4096 blocks, which makes a dense leaf 24KB, and that one number drives two costs. A checkpoint over a badly fragmented region writes roughly 6x the bytes that changed, and it rules out a key value backend like FoundationDB, which recommends values under ~10KB and would otherwise be attractive for mount time and for the RPO floor that rate limiting root writes imposes. Leaf size should be tunable, and the dense threshold may want to split a leaf rather than densify it
 4. Compression and encryption are unaddressed. Both belong at the segment boundary, which is also where they collide with range gets, since a read fault has to decrypt and decompress a slice rather than the whole object
 5. Roots and their deltas accumulate at one per epoch, so something has to expire them. A retention window bounds it, ~8,600 roots and deltas a day at 10s epochs, a few tens of MB, but the window and whether it is time or count based are unset
+6. Clones share segments across volume prefixes and nothing refcounts them. A volume's garbage collection has to account for roots in other volumes that reference its objects, and deleting a source volume would currently destroy every clone taken from it
+7. Hit rate is unmeasured. The eviction structure is chosen on the shape of the workload rather than on numbers from it, and the queue sizes, the ghost queue length and the sequential detector's thresholds are all guesses until there are traces to tune against
