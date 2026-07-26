@@ -207,10 +207,12 @@ data/seg/000000A1F4
 meta/pack/00000012               index pages written by checkpoint @ epoch 41200
 meta/pack/00000013               index pages written by checkpoint @ epoch 42200
 
-meta/delta/0000000000042201      ~1KB, one per epoch
-meta/delta/0000000000042202
+meta/delta/0000000000042801      ~1KB, one per epoch
+meta/delta/0000000000042802
    ...
 meta/delta/0000000000042847
+
+meta/merged/0000000000042800     the overlay serialized, one per ~100 epochs
 
 orphan/42847/3f2ab19c/           a fenced writer's last writes, root and segments
 
@@ -221,7 +223,8 @@ meta/root/0000000000042847       { epoch: 42847,
                                    tree: (pack 13, off 8192, len 3400),
                                    tree_bytes: 1046528,
                                    checkpoint_epoch: 42200,
-                                   delta_from: 42201,
+                                   merged_from: 42800,
+                                   delta_from: 42801,
                                    device_bytes: 109951162777600,
                                    logical_bytes: 8246337208320,
                                    physical_bytes: 11338713397657 }
@@ -287,12 +290,22 @@ Folding at the checkpoint is where leaves are loaded, and doing it in one batch 
 
 A root between checkpoints carries a tree from the last checkpoint plus a delta range, so it is only readable while those deltas exist. Retaining a root therefore retains its delta range, and the checkpoint skips any delta a retained root still spans. That is what makes a snapshot at an arbitrary epoch a real image rather than a pointer that stops resolving at the next checkpoint, and it is cheap, since a retained interval is ~1000 objects at ~1KB.
 
+Every ~100 epochs, around 15 minutes:
+
+```
+PUT meta/merged/N           the overlay serialized as it stands
+PUT meta/root/N             { ..., merged_from: N, delta_from: N+1 }
+```
+
+The overlay already holds the merged view of every delta since the last checkpoint, so writing it out costs one put and reads nothing. A merge exists to keep the delta stream short for whoever mounts next, which is a different concern from folding the tree and wants a different frequency: the tree checkpoint is paced by how much leaf rewriting is worth doing, a merge by how long a cold mount is allowed to take. It uses the same extent encoding as a delta, so it is ~1 byte per entry and reaches ~1MB by the end of a checkpoint interval, against the ~10MB the same map costs in memory. Each one rewrites content the previous already wrote, ~5.5MB across the interval, which is small enough to ignore.
+
 Mount:
 
 ```
 GET meta/head then meta/root/{epoch}   two small sequential gets
 GET the root page                      range get into its pack
-GET meta/delta/{delta_from..epoch}     in parallel, ~1000 objects, sub-second
+GET meta/merged/{merged_from}          one object, up to ~1MB
+GET meta/delta/{delta_from..epoch}     in parallel, up to 100 objects
 replay them into an overlay
 -> serving I/O
 
@@ -302,7 +315,7 @@ background:
   leaves faulted in on demand
 ```
 
-The overlay is a flat in memory map of block index to segment + slot, holding every epoch committed since the last checkpoint and consulted before descending the tree. It is how the map is maintained at all times, and mount rebuilds it by replaying the deltas the running writer holds in memory. Any lookup checks the overlay, then walks the tree, faulting what is missing. It is bounded by the checkpoint interval at ~1M entries, around 10MB, and is dropped once folded in.
+The overlay is a flat in memory map of block index to segment + slot, holding every epoch committed since the last checkpoint and consulted before descending the tree. It is how the map is maintained at all times, and mount rebuilds it by replaying the deltas the running writer holds in memory. Any lookup checks the overlay, then walks the tree, faulting what is missing. It is bounded by the checkpoint interval at ~1M entries, around 10MB, and is dropped once folded in. `meta/merged/N` is this same map serialized, and exists only so a cold mount can rebuild it without replaying every delta.
 
 Interior pages are pinned rather than faulted. They are few and small, ~724KB for 1TB as a root plus 256 interior pages and ~72MB for 100TB written, so holding all of them costs nothing next to the volume they describe and makes every cold lookup exactly one fetch, the leaf. Note this scales with written data rather than presented capacity, so a bottomless volume showing 100TB with 10TB written is ~7MB. The crossover where this stops being free is closer to 1PB written, at ~720MB.
 
@@ -310,14 +323,14 @@ They are pulled in the background rather than blocking the mount, and a lookup t
 
 Loading only the interior is the policy for a large tree. The checkpoint records the total serialized size of the tree in the root as `tree_bytes`, and below a threshold, say 256MB, we load all of it including leaves; a sequentially written 1TB volume is around 1MB in total, and pulling that in one range read means no metadata request ever reaches the read path. Above the threshold a faulting leaf widens its fetch to its neighbors in the same pack, which are the leaves for regions written at the same time, so the extra bytes are nearly free next to the request already being made. This is the same reasoning that makes contiguous packing worthwhile for data segments.
 
-Index pages can be faulted in lazily, but deltas cannot, because we cannot know which of them supersede a page we have not fetched yet. So the delta count between checkpoints is what sets mount latency, and it is the reason to bound it at ~1000 rather than letting the stream grow to the ~260k objects a month of 10s epochs would produce.
+Index pages can be faulted in lazily, but deltas cannot, because we cannot know which of them supersede a page we have not fetched yet. Everything committed since the last checkpoint has to be in hand before the first read is served, so the merge interval is the mount latency knob, and it is set independently of how often the tree is folded.
 
 ### Read path
 
 ```
 read LBA 9,412,096
   |- local cache map hit -> serve from local disk               (common case)
-  \- miss -> walk in-memory radix tree -> (segment A1F3, slot 412)
+  \- miss -> overlay, then the radix tree -> (segment A1F3, slot 412)
              range GET data/seg/000000A1F3 bytes 1687552..1691647
 ```
 
