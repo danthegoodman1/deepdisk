@@ -128,9 +128,15 @@ Dirty granules are exempt, since they are pinned until uploaded. Replacement the
 
 Heat is checkpointed with the granule table, so a worker restart resumes with its working set intact. The cached data survives a restart on its own, and this is what keeps it findable as valuable, since a cache that comes back uniformly cold loses its working set to the first scan that follows.
 
-A host with no local cache at all, after a migration, a clone or cache loss, gets a summary instead. The hottest granule ranges are published periodically to `meta/heat/N`, extent encoded and capped at a fixed number of ranges, and a cold mount prefetches them in heat order while it serves. That is what lets a clone start warm rather than paying for every block twice.
+A host with no local cache at all, after a migration, a clone or cache loss, gets a summary instead. The worker walks its main queue on its own timer and overwrites `meta/heat`, reading nothing, since the queues are already in memory. It sits outside the commit path entirely: no root references it, it takes no conditional create, and a second writer clobbering it costs a worse prefetch list and nothing more. A fixed key means a cold mount fetches it without knowing anything about epochs.
 
-Prefetch runs in the background, yields to demand traffic, and draws on the same bandwidth the supervisor leases, so warming a new host never competes with a volume that is already serving.
+What the summary holds is block ranges. A granule is 16 consecutive blocks, so what identifies it on another host is the address range it covers, and address ranges stay meaningful across hosts, clones and compaction in a way cache slots and segment IDs do not. Entries are extent encoded, bucketed into a few heat tiers, and sorted by address within each tier, so a prefetcher walks the tiers in order for priority and gets coalesced range reads inside each one. The object is capped at ~1MB, filled with the hottest extents that fit.
+
+Prefetch resolves each range through the manifest before it can fetch anything, so it follows the interior load rather than racing it, and it inherits the same locality: blocks that were hot together were usually written together, so they sit in the same segments and their range gets coalesce.
+
+Losing it costs a cold cache and nothing else, so it carries no retention rules and nothing has to collect it.
+
+Prefetch never gates I/O. Serving begins as soon as the manifest answers lookups, and a demand read for a range prefetch has not reached yet just fetches it. Prefetched granules are admitted at low value, the same as a detected sequential stream, so speculative data enters the small queue and reaches main only if something actually reads it, which keeps a wrong guess from evicting a working set that was loaded on demand. It draws on a bounded request budget that demand traffic preempts, and on the bandwidth the supervisor leases, so warming a new host never competes with a volume already serving. Past 60% dirty it stops entirely, since by then both cache space and upload bandwidth are worth more to the flusher.
 
 ### Flushing
 
@@ -237,7 +243,7 @@ Packs accumulate dead pages as those pages are superseded, so packs need livenes
 
 ### Layout
 
-Everything is immutable except `meta/head`:
+Everything is immutable except `meta/head`, and `meta/heat` which holds no durable state:
 
 ```
 data/seg/000000A1F3              4MB immutable segment, self describing
@@ -253,7 +259,7 @@ meta/delta/0000000000042847
 
 meta/merged/0000000000042800     the overlay serialized, one per ~100 epochs
 
-meta/heat/0000000000042800       hottest granule ranges, for a cold host to prefetch
+meta/heat                        hottest block ranges, overwritten freely, no durable state
 
 orphan/42847/3f2ab19c/           a fenced writer's last writes, root and segments
 
@@ -406,7 +412,7 @@ At the top of the watermark ladder the stall is held indefinitely, because the d
 
 Running one writer is the application's guarantee to make, and it is the operational requirement DeepDisk places on whoever deploys it. What follows detects a second writer and contains it. It does not make concurrent mounts work, and it does not recover what the second writer costs, so an orchestrator that fails over on unreachability alone will eventually lose data here. Unreachable and dead are different states, and only the deployment can tell them apart.
 
-Fencing lives entirely on the remote and the epoch is the token. Every head swap is conditional on the head still holding the epoch this writer last committed, so two writers advancing from the same epoch resolve into one winner and one conditional failure. Every object beneath the head is a conditional create as well, since those keys are deterministic and a second writer computes them identically: both pack segment `A1F4` and both write `meta/delta/106`, so under last write wins the winner's committed epoch could point at the loser's bytes. An existing key means another writer has claimed it, which fences on the first object of an epoch rather than at the root put. A writer retrying its own upload reads the header back and finds its own `writer_id`.
+Fencing lives entirely on the remote and the epoch is the token. Every head swap is conditional on the head still holding the epoch this writer last committed, so two writers advancing from the same epoch resolve into one winner and one conditional failure. Every object the head reaches is a conditional create as well, since those keys are deterministic and a second writer computes them identically: both pack segment `A1F4` and both write `meta/delta/106`, so under last write wins the winner's committed epoch could point at the loser's bytes. An existing key means another writer has claimed it, which fences on the first object of an epoch rather than at the root put. A writer retrying its own upload reads the header back and finds its own `writer_id`.
 
 The loser holds an invalid copy. Not a stale one that could be caught up and not a divergent one that could be merged, since its blocks were written against allocation state the winner never saw. So it flushes its dirty blocks to `orphan/{epoch}/{writer_id}/`, fails outstanding and subsequent I/O with `EIO`, and drops the mount, and it never re-reads the root to retry from the newer epoch, which is the one step that would turn a fence back into a race. That prefix holds a private root and its segments, so an operator can clone it into a separate volume and pull files out by hand. It is never applied onto the winner. Garbage collection also never touches it, since its liveness rules would read an unreferenced root as dead, so the prefix stays until an operator removes it and a split brain leaves a trace that does not expire on its own.
 
