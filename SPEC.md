@@ -6,6 +6,59 @@ It does this by using local disk as the durability boundary, while asynchronousl
 
 Because it is just a block device, that means the implementation can be simplified, and existing filesystems (ext4, xfs) can be used on top. Because there are no special filesystem rules, almost all Linux software will work out of the box on top, with the same performance a majority of the time.
 
+## Device
+
+DeepDisk attaches as a `ublk` device, a userspace block driver that passes requests over `io_uring`, so the policy engine, the object store client and the TLS stack all live in a normal userspace process while the kernel sees a real block device. `nbd` is the fallback for kernels older than 6.0.
+
+The daemon sits in the writeback path, which makes it a memory reclaim hazard. The kernel can flush dirty pages to satisfy an allocation, and if serving that flush requires the daemon to allocate, the two deadlock. So the daemon sets `PR_SET_IO_FLUSHER`, preallocates its request and segment buffers at startup, and locks itself in memory. Allocation on the hot path is a correctness bug.
+
+`ublk` also supports user recovery, where the daemon can exit and be restarted without tearing down the device or the filesystem above it. That matters because the daemon holds the dirty bitmap and the manifest overlay, so without it a restartable process becomes an outage.
+
+## Processes
+
+One worker process per volume, plus a singleton supervisor that owns the control API and nothing on the data path.
+
+Isolation decides it. A worker holds the dirty bitmap, the granule table and the manifest overlay for its volume, all in memory, so a crash is scoped to one volume and user recovery makes it survivable. Buffers are preallocated per worker, which keeps one volume's writeback from waiting on another to release memory.
+
+The host is what needs coordinating. Upload bandwidth, cache device capacity and compaction budget are shared across volumes, so the supervisor hands them out as leases, and a worker that loses contact keeps its last lease and decays to a fixed share.
+
+Workers serve I/O with no dependency on the supervisor being alive. A dead supervisor means no new control operations and no rebalancing, while every attached volume keeps serving. Each worker also exposes the same per volume API on its own socket, so a volume stays drivable while the supervisor is down.
+
+### Control API
+
+HTTP and JSON over a unix socket at `/run/deepdisk/control.sock`, guarded by filesystem permissions, since these calls create and destroy volumes.
+
+Epochs are the currency. Every call that changes durable state returns the epoch it produced and every call that reads it returns the epoch it observed, so a caller can always ask what point in time it is holding, and ask for everything up to now to become durable.
+
+```
+POST   /v1/volumes                       create, or clone with { clone_of }
+GET    /v1/volumes                       list
+GET    /v1/volumes/{id}                  epoch, watermark, dirty bytes, logical/physical
+DELETE /v1/volumes/{id}
+
+POST   /v1/volumes/{id}/attach           bring up the ublk device
+POST   /v1/volumes/{id}/detach           flush, commit, tear down
+
+POST   /v1/volumes/{id}/flush            -> { epoch, committed, noop }
+POST   /v1/volumes/{id}/checkpoint       fold the overlay, write a pack -> { epoch }
+POST   /v1/volumes/{id}/await            { epoch }, blocks until it is durable
+POST   /v1/volumes/{id}/grow             { device_bytes } -> { epoch }
+
+POST   /v1/volumes/{id}/snapshots        { epoch | "now" } -> { snapshot, epoch }
+GET    /v1/volumes/{id}/snapshots        each with the bytes it pins
+DELETE /v1/volumes/{id}/snapshots/{sid}
+POST   /v1/volumes/{id}/rollback         { epoch }, requires detached
+
+POST   /v1/volumes/{id}/compact          -> { job }
+GET    /v1/jobs/{id}
+```
+
+`flush` is the call to get right. It commits an epoch and returns its number, and if nothing is dirty it returns the current epoch immediately with `noop: true` rather than erroring or writing an empty commit, so calling it defensively is free. Concurrent calls coalesce onto one commit and all return the same epoch, which makes it safe to call from several places at once. An explicit flush also bypasses the ~1/s root write rate limit, since the caller is asking for a durability point rather than producing one incidentally. `wait=false` returns as soon as the epoch is assigned, to be paired with `await`.
+
+Clone is a copied root, so it is O(1) and needs no worker at all, just the supervisor copying one object under a new prefix. Cloning from `"now"` implies a flush first, cloning from a snapshot or an explicit epoch does not. A fork is a clone that is attached rather than left cold, which is the same primitive with one more step.
+
+Rollback requires the volume to be detached. Selecting an older root underneath a live device would leave the page cache and the filesystem above holding state from an epoch that no longer exists, and there is no way to recover from that in the layers that would notice, so the API refuses it rather than making it the caller's problem.
+
 ## Block caching
 
 The OS uses its own normal page cache, while the local disk cache is managed by DeepDisk. When we refere to the cache, we're referring to the local disk cache.
@@ -21,6 +74,16 @@ The rules follow this:
 1. Dirty blocks will always evict recently read blocks, or hit blocks
 2. Hot blocks can evict recently read blocks
 3. If the local cache is filled with dirty blocks due to local writes exceeding flush rate, the disk is throttled
+
+### Cache layout
+
+The cache is a raw block device or partition, not a file on a filesystem. A file would put a second allocator, a second journal and a second set of flush semantics underneath ours, all of which we would then be paying for and reasoning about on every write.
+
+Space is allocated in granules rather than blocks, 64KB by default, because a per block map does not fit: 1TB of cache is 256M blocks, and even a 10 byte entry is 2.5GB of RAM to address it. At 64KB it is 16M entries and ~160MB. Dirty state is still tracked per block inside the granule as a 16 bit mask, so coarse allocation never costs write amplification to the remote, and only the read that fills a granule is coarse.
+
+DeepDisk advertises a volatile write cache, so a write is acknowledged once it is in memory and only has to reach disk on `REQ_OP_FLUSH` or `REQ_FUA`. That is the same contract as any disk with a write cache, and it means the metadata cost below is paid once per barrier rather than once per write.
+
+Durability of the cache has the same shape as the manifest, a log plus a checkpoint, for the same reason. A barrier is not complete until both the data and enough metadata to find it again are on disk, so each one appends an intent record, `(granule, block mask, block index)` per granule touched, to a ring on the same device. The granule table is checkpointed periodically, and recovery is the last table plus the ring tail, which bounds recovery time by the ring size rather than by the size of the cache.
 
 ### Flushing
 
@@ -68,7 +131,7 @@ Segments are immutable, and an uploaded segment is invisible until a committed r
 
 The delta is proportional to the data it describes rather than to the size of the device, so committing stays cheap no matter how large the volume is. It should encode to little: the segment ID is constant across the entries and belongs in a header, the offset is implicit if entries are in segment slot order, which leaves only the block indices, and those are runs of consecutive values whenever packing was contiguous. A full 4MB segment is a few hundred bytes as extents, up to ~4KB for a random scatter.
 
-A full manifest is written periodically as a checkpoint, so recovery is the newest checkpoint plus the deltas since it, rather than the entire history.
+The index that these deltas apply to is checkpointed periodically, so recovery is the newest checkpoint plus the deltas since it rather than the entire history. See Manifest below.
 
 Recovery always restores the last committed root. Filesystem flush/FUA barriers are used as epoch boundaries where they land, since they mark points the filesystem itself considers consistent, and a barrier only costs a delta and a root write. Otherwise the epoch is cut on the age cap. Root writes are rate limited to ~1/s so a bursty workload cannot commit continuously, and use a conditional put so a writer that was partitioned and then revived cannot clobber a newer root.
 
@@ -84,6 +147,190 @@ That gives us, with no extra machinery:
 
 #### Failure and garbage
 
-A failed upload leaves its blocks dirty and retries with backoff, so a sustained remote outage walks up the watermarks into throttling and then stalling. Whether a stalled device should instead go read-only is open.
+A failed upload leaves its blocks dirty and retries with backoff, so a sustained remote outage walks up the watermarks into throttling and then stalling. See Errors below for what happens at the top of that ladder.
 
 Because the remote is copy-on-write, overwriting a block leaves the old value in place in an already uploaded segment, so dead data accumulates and segments have to be compacted. A block is dead only when no retained root references it, not simply when a newer write supersedes it, so a held snapshot pins segments that would otherwise be reclaimable. Space pinned per snapshot should be exposed as a metric, since a forgotten snapshot silently stops reclamation and grows the remote footprint without bound.
+
+## Manifest
+
+The manifest maps block index to segment + slot. There are two separate maps and this is the cold one: the local cache map (block index -> cache slot, dirty, heat) is consulted on every I/O and has to be fast, while the manifest is only consulted on a local cache miss, at which point we are already committed to a 20-100ms network fetch. A lookup taking microseconds is free in that context, so the manifest is optimized for size rather than latency.
+
+It is a write ahead log plus a periodically checkpointed index. The merged view is always materialized locally, and deltas are read only during mount. Writing index pages every epoch would amplify badly, since one scattered entry dirties a leaf plus its whole path to the root, so instead each epoch appends a small delta and the dirty pages accumulate in memory until a checkpoint makes them durable.
+
+### Structure
+
+Per block entries do not scale. At 6 bytes each, 1TB of 4K blocks is 1.5GB, and 10TB is 15GB. Because we pack spatially adjacent blocks into segments and slot order within a segment is implicit, a contiguous run is instead a single extent.
+
+The index is a radix tree over the block index. Block indices are dense integers, so there are no comparisons and no rebalancing, and unwritten regions are simply absent. That last property matters for a bottomless device, where most of the address space was never touched: a read of a never written block returns zeros with no I/O and costs nothing in the map.
+
+Pages are not fixed size, since object storage does not require it. A page serializes to whatever its encoding needs and its parent records the length.
+
+Interior entries are 11 bytes, `(index u8, pack u32, offset u32, len u16)`, so a fanout of 256 is 2816 bytes. Entries are locations rather than hashes, so an unchanged child is never rewritten and keeps pointing into whatever older pack it already lives in.
+
+A leaf covers 4096 blocks, 16MB of address space at 4K, and picks its encoding:
+
+1. Absent, never written, no parent entry and no bytes
+2. Single extent, one contiguous run, ~12 bytes
+3. Extent list, a few runs, varint delta encoded, ~8 bytes per extent
+4. Dense, badly fragmented, 4096 x 6 bytes = 24KB
+
+1TB written sequentially is ~65k single extent leaves plus 256 interior pages and a root, around 1MB of metadata. The same 1TB written as pure random 4K degenerates to dense leaves and ~1.5GB, which is why the tree lives on local disk with an LRU of pages in memory rather than being required to fit in RAM. A page fault on the manifest costs ~100us in front of a network fetch that costs 50ms.
+
+The tree is copy on write. The flusher builds new pages for the paths it touches and swaps the root with a release store, so readers take the root pointer and traverse an immutable snapshot with no locks on the read path at all. A block device has a single writer, so this needs no further coordination. Old pages are reclaimed once no reader holds them.
+
+Pages are packed rather than written individually. 65k tiny leaf objects would be a terrible object to byte ratio, so a checkpoint concatenates all of its dirty pages into one pack object and uploads it once, making a checkpoint 1-2 puts no matter how many pages changed.
+
+Within a pack, interior pages are serialized first and in tree order, ahead of the leaves. Nothing else constrains their placement, so without this the quality of a bulk interior load is accidental. Writing them contiguously and in level order turns loading the whole interior into a handful of near sequential range reads, and it compounds with locality aware compaction below.
+
+Because a child pointer is a location rather than a hash, a root to leaf path can span several packs, and a cold walk is then one range get per level into a different object. Two things keep that bounded. The tree is shallow, three levels at 1TB and four at 100TB, so it is at most three or four fetches rather than an unbounded chain. And copy on write dirties the whole path at once, so a freshly written root, interior page and leaf all land in the same pack. Jumping only happens descending from a hot ancestor into a subtree that has not changed in a long time, which is also the subtree least likely to be read.
+
+Packs accumulate dead pages as those pages are superseded, so packs need liveness tracking and compaction using the same mechanism as data segments. Compaction is locality aware: when live pages are rewritten out of old packs they are grouped by tree region, so a path lands back in a single pack. Reclaiming space is the lesser reason to run it, keeping walks from fanning out across a long tail of mostly dead packs is the greater one.
+
+### Layout
+
+Three object classes, and the root is the only mutable one:
+
+```
+data/seg/000000A1F3              4MB immutable segment, self describing
+data/seg/000000A1F4
+
+meta/pack/00000012               index pages written by checkpoint @ epoch 41200
+meta/pack/00000013               index pages written by checkpoint @ epoch 42200
+
+meta/delta/0000000000042201      ~1KB, one per epoch
+meta/delta/0000000000042202
+   ...
+meta/delta/0000000000042847
+
+meta/super                       { uuid, format_version, block_bytes: 4096 }
+
+meta/root                        { epoch: 42847,
+                                   tree: (pack 13, off 8192, len 3400),
+                                   tree_bytes: 1046528,
+                                   checkpoint_epoch: 42200,
+                                   delta_from: 42201,
+                                   device_bytes: 109951162777600,
+                                   logical_bytes: 8246337208320,
+                                   physical_bytes: 11338713397657 }
+```
+
+Keys are deterministic, and the root records the current checkpoint plus the live delta range, so we never list a prefix to find objects. Listing is only for garbage collection and repair.
+
+`meta/super` is written once at creation and never again. Block size cannot change without invalidating every mapping in the volume, so it lives in an object that nothing is allowed to rewrite, and is validated on mount.
+
+The root carries the sizes because they change with the epoch and have to be atomic with it:
+
+1. `device_bytes`, the capacity presented to Linux. Keeping it here makes an online grow a normal epoch commit rather than separate mutable state that can disagree with the manifest, and it means a volume mounted on another host needs nothing out of band. It must never shrink below the highest mapped block
+2. `logical_bytes`, the address space actually written. This is the thin provisioned used figure, and is what a bottomless device reports as consumed rather than `device_bytes`
+3. `physical_bytes`, live bytes across segments, which is what the remote is actually being billed for
+
+The gap between the last two is the garbage ratio, so compaction can be scheduled from two numbers in the root without scanning segments or walking the tree. All three are maintained incrementally, since recomputing them means a full scan.
+
+```
+                        root page          (pack 13)
+                      /      |      \
+              L1 page     L1 page     L1 page
+             (pack 13)   (pack 9)    (pack 13)     <- unchanged subtree still
+             /   |   \                                points into an older pack
+        leaf   leaf   leaf
+          |      |      |
+      SINGLE  EXTENT   DENSE
+      EXTENT   LIST    24KB
+       ~12B    ~200B
+```
+
+### Loops
+
+Every epoch, around 10s, which is two small puts plus the segment and no index pages:
+
+```
+PUT data/seg/...            the segment
+apply to the overlay        in memory, no leaves touched
+PUT meta/delta/N            the delta
+PUT meta/root               { epoch: N, tree: <unchanged>, delta_from: M+1 }
+mark blocks clean
+```
+
+An epoch never touches the tree. Applying to leaves instead would require them to be resident, so a write to a cold region would fault its leaf from the remote purely to overwrite entries in it, and that fetch would sit between the commit and marking blocks clean. Remote metadata latency would then feed straight into local dirty pressure and could throttle writes over metadata rather than data. The delta is the durable record and the tree is derived, so the tree is only updated when it is convenient to do so.
+
+Every ~1000 epochs, around 3h:
+
+```
+fold the overlay into leaves    faults only the leaves it touches, batched
+serialize pages dirtied since the last checkpoint -> one pack
+PUT meta/pack/K
+PUT meta/root               { epoch: N, tree: (K, off, len), delta_from: N+1 }
+DELETE meta/delta/M+1 .. N
+drop the overlay
+```
+
+Folding at the checkpoint is where leaves are loaded, and doing it in one batch means the loads coalesce across the whole interval instead of arriving a scattered handful at a time every 10s.
+
+Mount:
+
+```
+GET meta/root
+GET the root page                      range get into its pack
+GET meta/delta/{delta_from..epoch}     in parallel, ~1000 objects, sub-second
+replay them into an overlay
+-> serving I/O
+
+background:
+  L2   100 pointers    -> sorted, coalesced -> a few range gets    ~280KB
+  L1   25,600 pointers -> sorted, coalesced -> tens of range gets  ~72MB
+  leaves faulted in on demand
+```
+
+The overlay is a flat in memory map of block index to segment + slot, holding every epoch committed since the last checkpoint and consulted before descending the tree. It is not a mount artifact, it is how the map is maintained at all times, and mount simply rebuilds it by replaying the deltas that the running writer would have had in memory. Any lookup checks the overlay, then walks the tree, faulting what is missing. It is bounded by the checkpoint interval at ~1M entries, around 10MB, and is dropped once folded in.
+
+Interior pages are pinned rather than faulted. They are few and small, ~724KB for 1TB as a root plus 256 interior pages and ~72MB for 100TB written, so holding all of them costs nothing next to the volume they describe and makes every cold lookup exactly one fetch, the leaf. Note this scales with written data rather than presented capacity, so a bottomless volume showing 100TB with 10TB written is ~7MB. The crossover where this stops being free is closer to 1PB written, at ~720MB.
+
+They are pulled in the background rather than blocking the mount, and a lookup that arrives before its interior page does simply faults it. The load is breadth first and bulk rather than page at a time: once a level is parsed we hold every `(pack, offset, len)` for the level below, so those pointers are sorted by pack and offset and coalesced into large range reads, merging any two separated by less than ~64KB since reading junk bytes is far cheaper than a second request. That is three dependent rounds, since a level's locations are unknown until its parent is parsed, and tens of requests against the 25,701 a page at a time walk would issue, or ~700ms on 1Gbps against roughly 13s. It is also a cold host cost only, since the tree is materialized on local disk and a remount reads the same 72MB from NVMe in ~35ms.
+
+Loading only the interior is the policy for a large tree, not always the right one. The checkpoint records the total serialized size of the tree in the root as `tree_bytes`, and below a threshold, say 256MB, we load all of it including leaves; a sequentially written 1TB volume is around 1MB in total, and pulling that in one range read means no metadata request ever reaches the read path rather than one per region. Above the threshold a faulting leaf widens its fetch to its neighbors in the same pack, which are the leaves for regions written at the same time, so the extra bytes are nearly free next to the request already being made. This is the same reasoning that makes contiguous packing worthwhile for data segments.
+
+Index pages can be faulted in lazily, but deltas cannot, because we cannot know which of them supersede a page we have not fetched yet. So the delta count between checkpoints is what sets mount latency, and it is the reason to bound it at ~1000 rather than letting the stream grow to the ~260k objects a month of 10s epochs would produce.
+
+### Read path
+
+```
+read LBA 9,412,096
+  |- local cache map hit -> serve from local disk               (common case)
+  \- miss -> walk in-memory radix tree -> (segment A1F3, slot 412)
+             range GET data/seg/000000A1F3 bytes 1687552..1691647
+```
+
+Once warm there are no metadata requests on the read path, which is the property this layout exists to protect.
+
+### Reverse mapping
+
+Garbage collection needs to know which blocks in a segment are still live, and scanning the forward map to find out is far too expensive. Instead each segment carries a live block counter, decremented at epoch apply time when a block index that pointed at it is repointed, since the old value is already in hand at that moment. Garbage collection then sorts segments by live count. The counter is a cache and can be rebuilt by scanning if lost.
+
+Snapshots complicate this, because the counter only tracks the current root while a block is dead only when no retained root references it. Computing the union of live sets across retained roots during a collection pass is fine for a handful of snapshots, and gets expensive if hundreds are held.
+
+## Discard
+
+`REQ_OP_DISCARD` unmaps rather than writes. The manifest entry is removed, the local cache granule is freed, and the segment that held the data has its live counter decremented through the same reverse mapping path an overwrite uses. `logical_bytes` drops immediately, `physical_bytes` only when those segments are compacted.
+
+Because an absent entry already reads as zeros, DeepDisk can honestly report that discarded blocks return zeros deterministically. That is worth advertising, since it lets the filesystem skip zeroing ranges it has just released, and it makes `REQ_OP_WRITE_ZEROES` the same operation as discard rather than a write of real zeros.
+
+Discards arrive in floods, since `fstrim` releases everything a filesystem is not using in a single pass, so they have to be range operations. This is where the radix tree pays off a second time: unmapping a large range drops whole leaves and whole interior entries rather than clearing entries one at a time, so the cost is proportional to the tree nodes the range spans rather than to the blocks in it, and a discard covering an entire subtree is one entry removed from its parent.
+
+Unmapping commits like a write, as an entry in the epoch delta, so a discard is durable only once its epoch commits and is never visible remotely ahead of the root that records it.
+
+## Errors
+
+Reads and writes fail differently, because the truth is in different places. A write is durable locally the moment its barrier completes, so an unreachable remote costs us space rather than data, and the response is to accumulate dirty blocks and walk up the watermarks. A read that misses the local cache has no local truth to fall back on, so for it an unreachable remote is a real failure.
+
+A missing read retries with backoff against a deadline, 60s by default, then returns `EIO`. Retrying forever would park the caller in uninterruptible sleep and take the filesystem with it, which is indistinguishable from a hang and cannot be diagnosed from above. The deadline is generous because most outages are shorter than it and an `EIO` is expensive, often a read only remount.
+
+The write side has the same question at the top of the watermark ladder, and the default is the opposite. The stall is held indefinitely, because the data is already durable and the workload is only being asked to wait, so the outage costs latency rather than integrity. A deadline after which writes take `EIO` is available for workloads that would rather fail than block, but it is not the default: the read case fails by necessity, the write case would be failing by choice.
+
+## Open questions
+
+1. Garbage collection is sketched rather than designed. There is no policy for the garbage ratio that should trigger it, no bandwidth budget, and no defined interaction with the watermarks, which matters because compaction competes with flushing for the same upload capacity
+2. Snapshot liveness is a union across retained roots, fine for a handful and expensive at hundreds. Liveness may need to be tracked per snapshot, or snapshot count may need a bound
+3. Leaf size is fixed at 4096 blocks. A dense leaf is 24KB, so a checkpoint over a badly fragmented region writes far more bytes than the entries that changed, roughly 6x. It should probably be tunable, and the dense threshold may want to split a leaf rather than densify it
+4. Putting the manifest in a key value store rather than object storage, FoundationDB in particular, is attractive for mount time and for the RPO floor that rate limiting root writes imposes, but a 24KB dense leaf exceeds its recommended value size
+5. Compression and encryption are unaddressed. Both belong at the segment boundary, which is also where they collide with range gets, since a read fault has to decrypt and decompress a slice rather than the whole object
+6. A single writer is assumed throughout. Nothing forbids a second host mounting a snapshot read only, but nothing establishes it either
