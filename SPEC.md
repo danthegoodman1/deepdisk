@@ -57,8 +57,8 @@ Epochs are the currency. Every call that changes durable state returns the epoch
 
 ```
 POST   /v1/volumes                       create, or clone with { clone_of }
-GET    /v1/volumes                       list
-GET    /v1/volumes/{id}                  epoch, watermark, dirty bytes, logical/physical
+GET    /v1/volumes                       list, with size and attach state
+GET    /v1/volumes/{id}                  epoch, watermark, dirty, device/logical/physical
 DELETE /v1/volumes/{id}
 
 POST   /v1/volumes/{id}/attach           bring up the ublk device
@@ -90,8 +90,8 @@ Rollback requires the volume to be detached. Repointing the tree underneath a li
 
 ```
 deepdisk create <vol> --size 100T [--block-size 4096] --cache /dev/nvme0n1p2 --remote s3://bucket/prefix
-deepdisk ls
-deepdisk status <vol>                    epoch, watermark, dirty, logical/physical
+deepdisk ls                              size and attach state
+deepdisk status <vol>                    epoch, watermark, dirty, device/logical/physical
 deepdisk rm <vol> --yes
 
 deepdisk attach <vol> [--read-only] [--snapshot <id>]
@@ -481,6 +481,43 @@ The same rule runs at mount, since a writer can be fenced and then crash before 
 This protects the integrity of the remote. Two writers can never produce a torn or interleaved image, and a zombie serving reads mutates nothing. The flush window is separate: the writes the loser acknowledged and had not yet uploaded are unreachable from the winner, so split brain converts the age cap from an RPO window into a data loss window and one knob bounds both. Surviving a host means uploading, and fencing is orthogonal to it.
 
 Conditional put is a hard backend requirement. S3, GCS, Azure and R2 all expose it as ETag or object version preconditions, and a transactional store has it inherently.
+
+## Observability
+
+Four numbers are what to alert on. Everything after them is for working out what happened once one of them moves.
+
+`oldest_dirty_age` against `age_cap` is the live RPO: what a host failure would cost right now, as a maximum rather than an average. A flusher keeping up holds it near the cap and one falling behind walks it past.
+
+`dirty_fraction` is position on the watermark ladder, so it predicts a stall instead of reporting one.
+
+`cache_hit_rate` explains latency. Everything above DeepDisk feels this number and very little else.
+
+`physical_bytes` over `logical_bytes` is what deferring compaction costs, and both are already in the root, so reading it scans nothing.
+
+Reads are counted by where they were served as well as by how long they took, because that decomposition says what to do. A local hit, a lookup plus a segment range get, and a cold lookup that also faulted a leaf are three different problems with three different fixes, and a p99 distinguishes none of them.
+
+Latency is a histogram per stage rather than one across all of them, since the stages differ by three orders of magnitude and shared buckets would resolve none of them usefully:
+
+```
+read, local hit        ~100us     NVMe
+read, remote fetch     20-100ms   the range get, plus a leaf fault when cold
+read, device total     -          what ublk returns, the number the filesystem feels
+barrier                ~1ms       REQ_OP_FLUSH to durable on local disk
+segment upload         -          seal to acknowledged
+commit                 -          delta, root and head swap, floored by commit_rate
+checkpoint             -          fold and pack write
+mount                  -          by phase, against the merge interval that sets it
+```
+
+The barrier histogram is the one that checks the design rather than the deployment. An `fsync` above DeepDisk completes at local disk speed and never waits on the remote, so remote latency appearing in this distribution means that separation has broken somewhere.
+
+Saturation is counted beside it: segments awaiting upload, requests in flight against the leased budget, overlay entries against the checkpoint bound, and prefetch progress on a cold host. Time spent throttled or stalled belongs here too, since it is delay the application feels that no device latency accounts for.
+
+Then the slower signals: bytes pinned per snapshot, since a forgotten one silently stops reclamation, and lease utilisation, which is how a volume starved by a noisy neighbour becomes visible rather than merely slow.
+
+Some conditions matter more than any gauge and are logged as events as well as exposed as state: a fence, a checksum failure, entering or leaving a stall, an upload that failed after retries, and the existence of an orphan prefix. A fence carries a gauge of its own so it can be alerted on directly, since it is the one state where nothing recovers without an operator.
+
+Prometheus text at `GET /v1/metrics` on the control socket, labelled by volume, which is what `deepdisk metrics` prints.
 
 ## Configuration
 
