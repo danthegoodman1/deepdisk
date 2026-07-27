@@ -35,7 +35,7 @@ One worker process per volume, plus a singleton supervisor that owns the control
 
 Isolation decides it. A worker holds the dirty bitmap, the granule table and the manifest overlay for its volume, all in memory, so a crash is scoped to one volume and user recovery makes it survivable. Buffers are preallocated per worker, which keeps one volume's writeback from waiting on another to release memory.
 
-The host is what needs coordinating. Upload bandwidth, cache device capacity and compaction budget are shared across volumes, so the supervisor hands them out as leases, and a worker that loses contact keeps its last lease and decays to a fixed share.
+The host is what needs coordinating. Upload bandwidth and compaction budget are shared across volumes, so the supervisor hands them out as leases, and a worker that loses contact keeps its last lease and decays to a fixed share. Cache space is not among them, since each volume owns its own device.
 
 Workers serve I/O with no dependency on the supervisor being alive. A dead supervisor means no new control operations and no rebalancing, while every attached volume keeps serving. Each worker also exposes the same per volume API on its own socket, so a volume stays drivable while the supervisor is down.
 
@@ -59,10 +59,10 @@ Epochs are the currency. Every call that changes durable state returns the epoch
 POST   /v1/volumes                       create, or clone with { clone_of }
 GET    /v1/volumes                       list, with size and attach state
 GET    /v1/volumes/{id}                  epoch, watermark, dirty, device/logical/physical
-DELETE /v1/volumes/{id}
+DELETE /v1/volumes/{id}                  { limit } -> { deleted, remaining }
 
 POST   /v1/volumes/{id}/attach           bring up the ublk device
-POST   /v1/volumes/{id}/detach           flush, commit, tear down
+POST   /v1/volumes/{id}/detach           flush, commit, tear down, or { force }
 
 POST   /v1/volumes/{id}/flush            -> { epoch, committed, noop }
 POST   /v1/volumes/{id}/checkpoint       fold the overlay, write a pack -> { epoch }
@@ -82,6 +82,10 @@ GET    /v1/jobs/{id}
 
 Clone is a copied root, so it is O(1) and needs no worker at all, just the supervisor copying that object and `meta/heat` under a new prefix, the second so the clone starts warm instead of relearning what the source already knows. Cloning from `"now"` implies a flush first, cloning from a snapshot or an explicit epoch does not. A fork is a clone that is attached.
 
+Delete removes a bounded number of objects per call and reports what is left, so an operator paces reclaiming a large volume instead of issuing millions of deletes at once. The head goes first, which makes the volume unmountable from the moment the first call returns, so an interrupted delete is definitively gone rather than mysteriously broken, and every later call is resumable. `--all` loops for the impatient.
+
+Detach flushes, commits and tears down, and refuses if it cannot commit, reporting the dirty bytes it would have stranded. `--force` tears down anyway and leaves those blocks in the local cache, where a later attach on the same host resumes uploading them. The danger it protects against is detaching to move a volume elsewhere without noticing that recent writes are still sitting on the machine being left behind, so the amount is always printed rather than inferred.
+
 Rollback requires the volume to be detached. Repointing the tree underneath a live device leaves the page cache and the filesystem above holding state from a tree that no longer describes the volume, so the API refuses it.
 
 ### CLI
@@ -92,10 +96,10 @@ Rollback requires the volume to be detached. Repointing the tree underneath a li
 deepdisk create <vol> --size 100T [--block-size 4096] --cache /dev/nvme0n1p2 --remote s3://bucket/prefix
 deepdisk ls                              size and attach state
 deepdisk status <vol>                    epoch, watermark, dirty, device/logical/physical
-deepdisk rm <vol> --yes
+deepdisk rm <vol> --yes [--limit N] [--all]
 
 deepdisk attach <vol> [--read-only] [--snapshot <id>]
-deepdisk detach <vol>
+deepdisk detach <vol> [--force]
 
 deepdisk flush <vol> [--no-wait]         -> epoch
 deepdisk checkpoint <vol>                -> epoch
@@ -149,6 +153,8 @@ The rules follow this:
 ### Cache layout
 
 The cache is a raw block device or partition, so DeepDisk owns allocation, journaling and flush semantics all the way down to the hardware.
+
+One device belongs to one volume. A shared cache with a shared allocator would let one volume's dirty pressure starve another's read cache, which is the coupling the process model exists to avoid. Subdividing an NVMe across several volumes is a job for partitions or LVM, which already solve it, and DeepDisk sees a block device either way.
 
 Space is allocated in 64KB granules, 16 blocks at 4K, which keeps the map for 1TB of cache at 16M entries and ~160MB of RAM. Dirty state is still tracked per block inside the granule as a 16 bit mask, so coarse allocation costs no write amplification to the remote, and only the read that fills a granule is coarse.
 
@@ -318,6 +324,8 @@ meta/root/0000000000042847       { epoch: 42847,
                                    checkpoint_epoch: 42200,
                                    merged_from: 42800,
                                    delta_from: 42801,
+                                   next_segment: 42112,
+                                   next_pack: 14,
                                    device_bytes: 109951162777600,
                                    logical_bytes: 8246337208320,
                                    physical_bytes: 11338713397657 }
@@ -328,6 +336,12 @@ meta/head                        { epoch: 42847 }
 Roots are immutable and written one per epoch, and `meta/head` is the only mutable object in the volume. Committing is a create of the root followed by a compare and swap of the head, so the head is what fencing contends on and it stays small enough that the check is a few bytes. Every epoch that ever committed is still addressable, which is what rollback and point in time recovery reach for.
 
 Keys are deterministic, and the root records the current checkpoint plus the live delta range, so we never list a prefix to find objects. Listing is only for garbage collection and repair.
+
+Because keys are deterministic, no bucket lifecycle rule may be applied to a volume prefix. A segment is written once and then only read, so age says nothing about whether it is live, and a routine expiry policy would delete data a current root still points at.
+
+`next_segment` and `next_pack` are high water marks rather than last used values. Segments are uploaded before the commit that references them, so a writer draws IDs from a reserved range below the mark and a commit advances the mark past what the next interval will need. A crash leaves a gap of unused IDs, which costs nothing since IDs are opaque, and a restart resumes at the recorded mark, which is already beyond anything the previous incarnation could have issued. Without this a restart would reissue IDs its predecessor had already uploaded under, and every one of those puts would fail its conditional create.
+
+Creating a volume writes `meta/super`, then `meta/root/0` describing an empty tree, then `meta/head` at epoch 0. Every step is a conditional create, which makes the whole sequence idempotent: a create interrupted halfway is completed by running it again, and two concurrent creates resolve to one winner, with the loser finding `meta/super` already present and comparing it to decide whether it agrees. A volume is mountable only once the head exists, so a partial create reads as absent rather than as broken.
 
 `meta/super` is written once at creation and never again. Block size cannot change without invalidating every mapping in the volume, so it lives in an object that nothing is allowed to rewrite, and is validated on mount.
 
