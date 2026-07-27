@@ -84,6 +84,52 @@ Clone is a copied root, so it is O(1) and needs no worker at all, just the super
 
 Rollback requires the volume to be detached. Repointing the tree underneath a live device leaves the page cache and the filesystem above holding state from a tree that no longer describes the volume, so the API refuses it.
 
+### CLI
+
+`deepdisk` is a thin client over that socket, adding no surface of its own.
+
+```
+deepdisk create <vol> --size 100T [--block-size 4096] --cache /dev/nvme0n1p2 --remote s3://bucket/prefix
+deepdisk ls
+deepdisk status <vol>                    epoch, watermark, dirty, logical/physical
+deepdisk rm <vol> --yes
+
+deepdisk attach <vol> [--read-only] [--snapshot <id>]
+deepdisk detach <vol>
+
+deepdisk flush <vol> [--no-wait]         -> epoch
+deepdisk checkpoint <vol>                -> epoch
+deepdisk await <vol> <epoch>
+deepdisk grow <vol> --size 200T          -> epoch
+
+deepdisk snap <vol> [--at <epoch>]       -> snapshot, epoch
+deepdisk snaps <vol>                     each with the bytes it pins
+deepdisk snap rm <vol> <snap> --yes
+deepdisk rollback <vol> --to <epoch> --yes
+
+deepdisk clone <src> <dst> [--at <epoch> | --snapshot <id>]
+deepdisk fork <src> <dst>                clone and attach
+
+deepdisk compact <vol>                   -> job
+deepdisk jobs [<job>]
+deepdisk metrics [<vol>]
+```
+
+It is built to be driven by scripts and agents as much as by people. Every command takes `--json`, and human output is never the only format. Nothing ever prompts, so destructive operations take `--yes` instead of asking. Commands that produce an epoch print it alone on stdout, so `EPOCH=$(deepdisk flush vol0)` works.
+
+Exit codes separate the cases a caller would act on differently:
+
+```
+0   ok
+1   usage or arguments
+2   no such volume, snapshot or job
+3   conflict, the operation is refused in this state, such as rollback while attached
+4   degraded, stalled or the remote is unreachable, retrying may succeed
+5   fenced, the volume needs an operator and retrying will not help
+```
+
+Socket discovery follows the same rule the daemons do. It tries `/run/deepdisk/control.sock`, and for a command naming one volume it falls back to that volume's own socket, so a supervisor that is down never blocks operating a volume that is up.
+
 ## Block caching
 
 The OS uses its own normal page cache, while the local disk cache is managed by DeepDisk. When we refere to the cache, we're referring to the local disk cache.
@@ -421,6 +467,54 @@ The same rule runs at mount, since a writer can be fenced and then crash before 
 This protects the integrity of the remote. Two writers can never produce a torn or interleaved image, and a zombie serving reads mutates nothing. The flush window is separate: the writes the loser acknowledged and had not yet uploaded are unreachable from the winner, so split brain converts the age cap from an RPO window into a data loss window and one knob bounds both. Surviving a host means uploading, and fencing is orthogonal to it.
 
 Conditional put is a hard backend requirement. S3, GCS, Azure and R2 all expose it as ETag or object version preconditions, and a transactional store has it inherently.
+
+## Configuration
+
+```
+volume, fixed at creation
+  block_bytes           4096      changing it invalidates every mapping
+  granule_bytes         64KB      local cache allocation unit
+  leaf_blocks           4096      manifest leaf coverage, 16MB of address space
+  cache_device          -         raw device or partition
+  remote                -         bucket and prefix
+
+volume, tunable
+  device_bytes          -         presented capacity, grows only
+  segment_bytes         4MB       upload unit, 4-8MB
+  age_cap               10s       oldest dirty block before a flush, the RPO knob
+  idle_seal             250ms     quiet period after which a partial segment seals
+  overwrite_window      1s        holds back very recent writes, always overridable
+  commit_rate           1/s       floor on the interval between epochs
+  merge_interval        100       epochs between meta/merged writes, the mount knob
+  checkpoint_interval   1000      epochs between tree folds
+  read_deadline         60s       before a missing read returns EIO
+  write_deadline        off       before a stalled write returns EIO
+
+watermarks, as a fraction of the cache held dirty
+  steady                25%       background flush begins
+  aggressive            60%       maximum upload concurrency, overwrite window ignored
+  throttle              85%       incoming writes slowed
+  stall                 95%       incoming writes blocked
+
+cache
+  small_queue           10%       of capacity, the admission filter
+  ghost_entries         1x main   fingerprints of evicted granules
+  prefetch_cutoff       60%       dirty fraction at which prefetch stops
+  heat_bytes            1MB       cap on the published working set summary
+
+manifest
+  full_load_threshold   256MB     tree_bytes under which leaves are loaded too
+  coalesce_gap          64KB      range reads closer than this are merged
+
+host
+  upload_budget         all       leased across volumes by the supervisor
+  compaction_budget     all       the same
+  lease_ttl             30s       after which a worker decays to a fixed share
+```
+
+Three of these are the ones worth reaching for. `age_cap` sets how much data a host failure costs. `merge_interval` sets cold mount latency. `checkpoint_interval` sets how much metadata is rewritten. The rest have defaults that should hold.
+
+The fixed group is fixed for different reasons. `block_bytes` is recorded in `meta/super` and validated on mount, since every mapping in the volume is expressed in it. `granule_bytes` and `leaf_blocks` are structural rather than durable, so changing them is possible by rebuilding, not by setting a flag.
 
 ## Open questions
 
