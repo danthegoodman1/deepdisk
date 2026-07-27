@@ -4,7 +4,7 @@ DeepDisk is a bottomles block device (disk) for Linux that offers local read and
 
 It does this by using local disk as the durability boundary, while asynchronously writing in batches to another storage location (e.g. S3). DeepDisk also keeps track of block heat, and locally caches blocks in disk.
 
-Because it is just a block device, that means the implementation can be simplified, and existing filesystems (ext4, xfs) can be used on top. Because there are no special filesystem rules, almost all Linux software will work out of the box on top, with the same performance a majority of the time.
+Because it is just a block device, that means the implementation can be simpler than a network filesystem, and existing filesystems (ext4, xfs) can be used on top. Because there are no special filesystem rules, almost all Linux software will work out of the box on top, with the same performance except under extreme write pressure or very sparse reads.
 
 ## Units
 
@@ -56,12 +56,12 @@ HTTP and JSON over a unix socket at `/run/deepdisk/control.sock`, guarded by fil
 Epochs are the currency. Every call that changes durable state returns the epoch it produced and every call that reads it returns the epoch it observed, so a caller can always ask what point in time it is holding, and ask for everything up to now to become durable.
 
 ```
-POST   /v1/volumes                       create, or clone with { clone_of }
+POST   /v1/volumes                       create with { remote }, or clone with { clone_of }
 GET    /v1/volumes                       list, with size and attach state
-GET    /v1/volumes/{id}                  epoch, watermark, dirty, device/logical/physical
+GET    /v1/volumes/{id}                  epoch, watermark, dirty, device/logical/physical, remote
 DELETE /v1/volumes/{id}                  { limit } -> { deleted, remaining }
 
-POST   /v1/volumes/{id}/attach           bring up the ublk device
+POST   /v1/volumes/{id}/attach           bring up the ublk device, takes { remote }
 POST   /v1/volumes/{id}/detach           flush, commit, tear down, or { force }
 
 POST   /v1/volumes/{id}/flush            -> { epoch, committed, noop }
@@ -94,11 +94,13 @@ Rollback requires the volume to be detached. Repointing the tree underneath a li
 
 ```
 deepdisk create <vol> --size 100T [--block-size 4096] --cache /dev/nvme0n1p2 --remote s3://bucket/prefix
+                      [--endpoint <url>] [--region <r>] [--addressing path|vhost]
 deepdisk ls                              size and attach state
 deepdisk status <vol>                    epoch, watermark, dirty, device/logical/physical
 deepdisk rm <vol> --yes [--limit N] [--all]
 
 deepdisk attach <vol> [--read-only] [--snapshot <id>]
+                      [--endpoint <url>] [--region <r>] [--addressing path|vhost] [--ca <path>]
 deepdisk detach <vol> [--force]
 
 deepdisk flush <vol> [--no-wait]         -> epoch
@@ -118,6 +120,8 @@ deepdisk compact <vol>                   -> job
 deepdisk jobs [<job>]
 deepdisk metrics [<vol>]
 ```
+
+Credentials are the one input that is never an argument. `create` and `attach` read `DEEPDISK_ACCESS_KEY_ID`, `DEEPDISK_SECRET_ACCESS_KEY` and `DEEPDISK_SESSION_TOKEN` from the environment, or `--credentials-file` naming a file the CLI reads itself, and send the values over the socket.
 
 It is built to be driven by scripts and agents as much as by people. Every command takes `--json`, and human output is never the only format. Nothing ever prompts, so destructive operations take `--yes` instead of asking. Commands that produce an epoch print it alone on stdout, so `EPOCH=$(deepdisk flush vol0)` works.
 
@@ -224,6 +228,10 @@ As a fraction of the local cache occupied by dirty blocks:
 5. Over 95%, writes stall
 
 Dirty and clean share one device, so this ladder is also what reserves space for the read cache: the stall at 95% is the floor that keeps a clean portion at all. Tuning these for flush behaviour tunes read hit rate at the same time.
+
+Throttling is admission control on granule allocation. Below the watermark a write needing space takes it from the clean pool through the replacement policy. Above it, the write instead waits for an upload to complete and its epoch to commit, which unpins a dirty granule and returns it to the pool. Writes are then paced to exactly the rate the flusher drains at, and the clean portion is preserved for reads rather than consumed to absorb a burst. A write landing in a granule the volume already holds dirty needs no allocation and is never throttled, so an overwrite-heavy workload passes through. Waiters are served in arrival order.
+
+The stall is this same mechanism with nothing completing to wait on, so it is reached when uploads have stopped rather than merely fallen behind. This is why the ladder is bimodal in practice: a workload that outruns the flusher settles at the throttle watermark and stays there, and only losing the remote walks it to the top.
 
 #### Epochs
 
@@ -460,6 +468,16 @@ Discards arrive in floods, since `fstrim` releases everything a filesystem is no
 
 Unmapping commits like a write, as an entry in the epoch delta, so a discard is durable only once its epoch commits and is never visible remotely ahead of the root that records it.
 
+## Remote
+
+The S3 API is the interface and no provider behind it is assumed.
+
+A volume's identity is its bucket and prefix, fixed at creation. How a host reaches that bucket is not, so endpoint, region, addressing, TLS trust and credentials are supplied to create and attach and hold for the life of the attachment. Both calls exercise them before returning, writing a `_deepdisk` probe object under the prefix and deleting it, or listing instead when the attach is read only. Credentials are held in memory and never returned by a get, the rest comes back from `GET /v1/volumes/{id}`.
+
+A 403 after a successful attach means revoked or expired rather than unlucky, so it is logged as an event immediately instead of disappearing into upload retries, and uploads then fail into the watermark ladder as any unreachable remote does. A read only attach needs get and list alone, which makes that flag enforceable at the boundary rather than only by us. A clone reads its source's prefix as well as its own, so its credentials have to cover both.
+
+Five operations are required: range get, put with conditional create, put conditional on the current version for the head swap, delete, and list by prefix. Conditional support is the discriminator, and a backend that accepted the header and ignored it would break fencing silently. So create reuses `_deepdisk` for it, writing the key twice and then replacing against a stale version, expecting refusal both times and refusing the volume otherwise. Paying that cost once is what lets every later write assume it.
+
 ## Integrity
 
 S3 checksums on upload, verifies at rest and repairs from redundancy, so object bit rot is its problem and DeepDisk uses its native CRC32C rather than duplicating it. Two things sit outside that reach.
@@ -494,7 +512,7 @@ The same rule runs at mount, since a writer can be fenced and then crash before 
 
 This protects the integrity of the remote. Two writers can never produce a torn or interleaved image, and a zombie serving reads mutates nothing. The flush window is separate: the writes the loser acknowledged and had not yet uploaded are unreachable from the winner, so split brain converts the age cap from an RPO window into a data loss window and one knob bounds both. Surviving a host means uploading, and fencing is orthogonal to it.
 
-Conditional put is a hard backend requirement. S3, GCS, Azure and R2 all expose it as ETag or object version preconditions, and a transactional store has it inherently.
+The preconditions all of this rests on are proven against the backend when the volume is created, so fencing assumes them at runtime rather than discovering at the moment of a split brain that they were never honoured.
 
 ## Observability
 
@@ -529,7 +547,7 @@ Saturation is counted beside it: segments awaiting upload, requests in flight ag
 
 Then the slower signals: bytes pinned per snapshot, since a forgotten one silently stops reclamation, and lease utilisation, which is how a volume starved by a noisy neighbour becomes visible rather than merely slow.
 
-Some conditions matter more than any gauge and are logged as events as well as exposed as state: a fence, a checksum failure, entering or leaving a stall, an upload that failed after retries, and the existence of an orphan prefix. A fence carries a gauge of its own so it can be alerted on directly, since it is the one state where nothing recovers without an operator.
+Some conditions matter more than any gauge and are logged as events as well as exposed as state: a fence, a checksum failure, entering or leaving a stall, an upload that failed after retries, credentials refused after a successful attach, and the existence of an orphan prefix. A fence carries a gauge of its own so it can be alerted on directly, since it is the one state where nothing recovers without an operator.
 
 Prometheus text at `GET /v1/metrics` on the control socket, labelled by volume, which is what `deepdisk metrics` prints.
 
@@ -541,7 +559,13 @@ volume, fixed at creation
   granule_bytes         64KB      local cache allocation unit
   leaf_blocks           4096      manifest leaf coverage, 16MB of address space
   cache_device          -         raw device or partition
-  remote                -         bucket and prefix
+  remote                -         bucket and prefix, the volume's identity
+
+remote access, supplied per attach
+  endpoint              -         any host speaking the S3 API
+  region                -         signing region, when the backend uses one
+  addressing            auto      path or virtual host
+  ca_bundle             system    trust for a private endpoint
 
 volume, tunable
   device_bytes          -         presented capacity, grows only
@@ -558,8 +582,8 @@ volume, tunable
 watermarks, as a fraction of the cache held dirty
   steady                25%       background flush begins
   aggressive            60%       maximum upload concurrency, overwrite window ignored
-  throttle              85%       incoming writes slowed
-  stall                 95%       incoming writes blocked
+  throttle              85%       allocating writes wait on flush completions
+  stall                 95%       nothing completing, writes blocked
 
 cache
   small_queue           10%       of capacity, the admission filter
@@ -578,6 +602,8 @@ host
 ```
 
 Three of these are the ones worth reaching for. `age_cap` sets how much data a host failure costs. `merge_interval` sets cold mount latency. `checkpoint_interval` sets how much metadata is rewritten. The rest have defaults that should hold.
+
+Credentials are missing from this table on purpose. They belong to the attach that supplied them rather than to the volume, so they have no default and no stored value, see Remote above.
 
 The fixed group is fixed for different reasons. `block_bytes` is recorded in `meta/super` and validated on mount, since every mapping in the volume is expressed in it. `granule_bytes` and `leaf_blocks` are structural rather than durable, so changing them is possible by rebuilding, not by setting a flag.
 
