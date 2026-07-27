@@ -66,7 +66,7 @@ Epochs are the currency. Every call that changes durable state returns the epoch
 ```
 POST   /v1/volumes                       create with { remote }, or fork with { fork_of, at }
 GET    /v1/volumes                       list, with size, attach state and sibling heads
-GET    /v1/volumes/{id}                  epoch, watermark, dirty, device/logical/physical, remote
+GET    /v1/volumes/{id}                  epoch, watermark, dirty, sizes, usage as of, remote
 DELETE /v1/volumes/{id}                  { limit } -> { deleted, remaining }
 
 POST   /v1/volumes/{id}/attach           bring up the ublk device, takes { remote }
@@ -106,7 +106,7 @@ deepdisk create <vol> --size 100T [--block-size 4096] --remote s3://bucket/prefi
                       --cache /dev/nvme0n1p2 [--cache-size 100G]
                       [--endpoint <url>] [--region <r>] [--addressing path|vhost]
 deepdisk ls                              size and attach state
-deepdisk status <vol>                    epoch, watermark, dirty, device/logical/physical
+deepdisk status <vol>                    epoch, watermark, dirty, device/logical, usage as of
 deepdisk rm <vol> --yes [--limit N] [--all]
 
 deepdisk attach <vol> [--read-only] [--snapshot <id>] [--cache-size 100G]
@@ -378,6 +378,8 @@ meta/delta/0000000000042802
    ...
 meta/delta/0000000000042847
 
+meta/usage                       what the last collection pass found, no durable state
+
 orphan/main/42847/3f2ab19c/      a fenced writer's last writes, root and segments
 
 meta/super                       { uuid, format_version, block_bytes: 4096 }
@@ -390,7 +392,7 @@ meta/root/0000000000042847       { epoch: 42847,
                                    delta_from: 42801,
                                    device_bytes: 109951162777600,
                                    logical_bytes: 8246337208320,
-                                   physical_bytes: 11338713397657 }
+                                   superseded_bytes: 3092376453 }
 
 meta/head/main                   { epoch: 42847 }
 meta/head/dev-fork-1             { epoch: 42800 }
@@ -416,9 +418,17 @@ The root carries the sizes because they change with the epoch and have to be ato
 
 1. `device_bytes`, the capacity presented to Linux. Keeping it here makes an online grow a normal epoch commit rather than separate mutable state that can disagree with the manifest, and it means a volume mounted on another host needs nothing out of band. It must never shrink below the highest mapped block
 2. `logical_bytes`, the address space actually written. This is the thin provisioned used figure, and is what a bottomless device reports as consumed rather than `device_bytes`
-3. `physical_bytes`, total bytes stored under the prefix, garbage and metadata objects included. This is the bill, so it counts dead regions inside segments right up until compaction reclaims them, and it counts packs and deltas. It is a property of the prefix rather than of one head, so every head over a store reports the same figure and it is never double counted across forks. What differs per head is how much of it that head alone reaches, which is reported beside it
+3. `superseded_bytes`, how much this head has orphaned since the last collection pass it saw. A repointed block already decrements its old segment's live counter, so the byte count comes free at the same moment, and compaction is excluded because relocating a live block orphans nothing
 
-The gap between the last two is what deferring compaction costs, so a pass can be scheduled from two numbers in the root without scanning segments or walking the tree. All three are maintained incrementally, since recomputing them means a full scan.
+All three are per head and all three are exact. What is not in the root is a figure for the bytes stored under the prefix, and leaving it out is deliberate.
+
+Heads share a prefix and advance independently, so no single writer knows what the prefix holds, and a per head root is the wrong place to claim otherwise. Two heads each recording a prefix total would record different ones and neither would be right. The honest division is that a head reports what it can know exactly, and everything prefix wide comes from the only thing that ever sees the whole prefix, which is a collection pass.
+
+`meta/usage` is what a pass leaves behind: when it ran, live and dead bytes for the prefix, and per head the bytes only that head reaches. That last number is the one an operator actually wants, since it answers what deleting a fork would free, and a pass computes it for nothing because the liveness union already walks every reference. It holds no durable state, so it takes no conditional create and a stale or missing one costs a worse answer and nothing else.
+
+The bill belongs to the provider. Every object store meters stored bytes and issues an invoice from its own count, and a number DeepDisk maintains can at best approximate one that is already computed exactly somewhere else. What DeepDisk owes is the two things the provider cannot tell you: how much of that storage is garbage, and which fork is holding it.
+
+`superseded_bytes` against the live figure from the last pass is therefore the compaction signal, and it needs no scan. In a forked prefix it overestimates, since one head can supersede a block another still reaches, which is the right direction for a trigger: it errs toward running a pass, and the pass is what establishes the truth.
 
 ```
                         root page          (pack 13)
@@ -524,7 +534,7 @@ It yields to flushing rather than competing with it. Compaction draws from the s
 
 A compacted segment is deletable once the epoch that stopped referencing it has committed and no retained root spans an epoch that still referenced it. Pack compaction is the same operation against the manifest and rides a checkpoint instead of an epoch, grouping live pages by tree region as described in Structure.
 
-What is still open is the trigger. `physical_bytes` over `logical_bytes` says how much garbage there is without scanning anything, but the ratio at which a pass is worth running, and how that interacts with the retention window that is keeping the garbage alive, are unset.
+What is still open is the trigger. `superseded_bytes` against the live figure `meta/usage` recorded says how much garbage has accumulated without scanning anything, but the ratio at which a pass is worth running, and how that interacts with the retention window that is keeping the garbage alive, are unset.
 
 ## Concurrency
 
@@ -546,7 +556,7 @@ All of it is preallocated and locked. The slot table, the forward index, the reg
 
 ## Discard
 
-`REQ_OP_DISCARD` unmaps rather than writes. The manifest entry is removed, the cache slots holding those blocks are marked dead, and the segment that held the data has its live counter decremented through the same reverse mapping path an overwrite uses. `logical_bytes` drops immediately, `physical_bytes` only when those segments are compacted.
+`REQ_OP_DISCARD` unmaps rather than writes. The manifest entry is removed, the cache slots holding those blocks are marked dead, and the segment that held the data has its live counter decremented through the same reverse mapping path an overwrite uses. `logical_bytes` drops immediately and `superseded_bytes` rises by the same amount, while the storage itself is only released when those segments are compacted.
 
 A discard of a block that is still dirty and unuploaded drops it from the segment being packed, so it never leaves the host. A discard of one already packed into a sealed segment cannot, so that segment ships with a block nothing will ever reference and the delta records the unmap, which is correct and merely wasteful for as long as it takes compaction to notice.
 
@@ -570,7 +580,9 @@ Rotation is still a thing operators do, so `POST /v1/volumes/{id}/credentials` r
 
 Encryption is out of scope, and it composes rather than being missing. A deployment that needs client held keys puts `dm-crypt` between the filesystem and `/dev/deepdisk0`, so DeepDisk sees ciphertext blocks and never sees a key; one that needs encryption at rest against the storage provider turns on SSE-S3 or SSE-KMS on the bucket, which also covers the `meta/` objects `dm-crypt` cannot reach. Both are standard, both are someone else's problem to get right, and holding keys is a liability worth not taking on. Object formats carry a version field so this can be revisited, but nothing is reserved for it.
 
-Five operations are required: range get, put with conditional create, put conditional on the current version for the head swap, delete, and list by prefix. Conditional support is the discriminator, and a backend that accepted the header and ignored it would break fencing silently. So create reuses `_deepdisk` for it, writing the key twice and then replacing against a stale version, expecting refusal both times and refusing the volume otherwise. Paying that cost once is what lets every later write assume it.
+Five operations are required: range get, put with conditional create, put conditional on the current version for the head swap, delete, and list by prefix. Conditional support is the discriminator, and a backend that accepted the header and ignored it would break fencing silently. So create reuses `_deepdisk` to prove it, and the proof has to be concurrent rather than sequential, because the property fencing needs is atomicity under contention and that is not what a sequential check observes. A backend can honour `If-Match` request by request and still resolve a tie by last write wins, or serialise per key only within one gateway node, and every one of those passes a probe that writes twice and waits.
+
+Three rounds, each firing several conditional writes at once against the same base version, asserting exactly one succeeds and the rest are refused. Conditional create is proved the same way, several creates of one key with exactly one winner. Anything else refuses the volume. Paying that once, before there is data on the bucket, is what lets every later write assume it, and it is the difference between discovering a backend's limits at create time and discovering them during a split brain.
 
 ## Integrity
 
@@ -644,7 +656,7 @@ Four numbers are what to alert on. Everything after them is for working out what
 
 `cache_hit_rate` explains latency. Everything above DeepDisk feels this number and very little else.
 
-`physical_bytes` over `logical_bytes` is what deferring compaction costs, and both are already in the root, so reading it scans nothing.
+`superseded_bytes` is what deferring compaction has cost since the last pass, and it is in the root, so reading it scans nothing. `meta/usage` carries the live figure it is measured against, and how stale that figure is says how much to trust the ratio.
 
 Reads are counted by where they were served as well as by how long they took, because that decomposition says what to do. A local hit, a lookup plus a segment range get, and a cold lookup that also faulted a leaf are three different problems with three different fixes, and a p99 distinguishes none of them.
 
@@ -667,7 +679,7 @@ Saturation is counted beside it: segments awaiting upload, requests in flight ag
 
 The cache has two of its own. Bytes relocated per second is the write amplification log structure costs, all of it survivors copied out at reclaim, and it is the number that says whether the region size is wrong. Forward index occupancy against its capacity is the other, since the table is fixed at startup and a workload that fragments the cached set does not get to grow it.
 
-Then the slow signal: bytes pinned per snapshot, since a forgotten one silently stops reclamation.
+Then the slow signals, all of them from the last collection pass: bytes pinned per snapshot, since a forgotten one silently stops reclamation, and bytes reached only by each head, since a forgotten fork does the same thing and is harder to notice.
 
 Some conditions matter more than any gauge and are logged as events as well as exposed as state: a fence, a checksum failure, entering or leaving a stall, an upload that failed after retries, credentials refused after a successful attach, and the existence of an orphan prefix. A fence carries a gauge of its own so it can be alerted on directly, since it is the one state where nothing recovers without an operator.
 
@@ -754,7 +766,7 @@ Nothing in this table sets the daemon's memory footprint directly, because it is
 
 ## Open questions
 
-1. Compaction now has an owner and a priority, but not a trigger. `physical_bytes` over `logical_bytes` gives the garbage ratio without scanning anything, and the ratio at which a pass is worth running is unset, as is how that interacts with the retention window keeping the garbage alive
+1. Compaction now has an owner, a priority and a signal, but not a trigger. `superseded_bytes` against the live figure from the last pass gives the garbage ratio without scanning anything, and the ratio at which a pass is worth running is unset, as is how that interacts with the retention window keeping the garbage alive
 2. Snapshot liveness is a union across retained roots, fine for a handful and expensive at hundreds. Liveness may need to be tracked per snapshot, or snapshot count may need a bound
 3. Leaf size is fixed at 4096 blocks, which makes a dense leaf 24KB, and that one number drives two costs. A checkpoint over a badly fragmented region writes roughly 6x the bytes that changed, and it rules out a key value backend like FoundationDB, which recommends values under ~10KB and would otherwise be attractive for mount time and for the RPO floor that rate limiting root writes imposes. Leaf size should be tunable, and the dense threshold may want to split a leaf rather than densify it
 4. Compression is unaddressed. It belongs at the segment boundary, which is also where it collides with range gets, since a read fault has to decompress a slice rather than the whole object. Encryption above rules it out in practice, since ciphertext does not compress, so this is only worth taking up for a deployment that has chosen not to encrypt
