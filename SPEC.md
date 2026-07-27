@@ -23,9 +23,17 @@ Regions are local and segments are remote, and neither has anything to do with t
 
 ## Device
 
-DeepDisk attaches as a `ublk` device, a userspace block driver that passes requests over `io_uring`, so the policy engine, the object store client and the TLS stack all live in a normal userspace process while the kernel sees a real block device. Linux 6.0 or newer is required.
+DeepDisk attaches as a `ublk` device, a userspace block driver that passes requests over `io_uring`, so the policy engine, the object store client and the TLS stack all live in a normal userspace process while the kernel sees a real block device. It is the only device backend, so Linux 6.0 or newer is a hard requirement.
 
-The daemon sits in the writeback path, which makes it a memory reclaim hazard. The kernel can flush dirty pages to satisfy an allocation, and if serving that flush requires the daemon to allocate, the two deadlock. So the daemon sets `PR_SET_IO_FLUSHER`, preallocates its request buffers, region buffers, cache map and remote client arena at startup, and locks itself in memory. Allocation on the hot path is a correctness bug, which means it is something to test for rather than to intend, see Concurrency.
+The daemon sits in the writeback path, which makes it a memory reclaim hazard. Reclaim flushes dirty pages to satisfy an allocation; that flush reaches the filesystem, the block layer, `ublk` and then the daemon; and if serving it requires the daemon to allocate, that allocation enters the same reclaim already waiting on it. Nothing times out. The machine hangs with the filesystem mid writeback and the only way out is a reset.
+
+`PR_SET_IO_FLUSHER` is half the answer. It sets `PF_MEMALLOC_NOIO`, so the daemon's own allocations do not recurse into I/O to satisfy themselves, and `PF_LOCAL_THROTTLE`, so a writeback participant is not throttled against its own writeback. It needs `CAP_SYS_RESOURCE`. What it does not do is make an allocation succeed: it converts a deadlock into a stall or a failure, so not allocating remains a requirement in its own right.
+
+Not allocating is a property of every line rather than a rule anyone can hold in their head, and the process contains a TLS stack and an HTTP client that allocate per request by construction. So the daemon reserves one arena at startup, sized from the cache device and the configured concurrency, locks it, and runs a global allocator over it. Everything after initialisation is served out of memory the process already owns and the kernel is not involved, which replaces reclaim deadlock with arena exhaustion: bounded, observable and reportable.
+
+That is also what makes the claim testable. The allocator counts every fall through to the system allocator, and that count is asserted zero after warmup under the full workload. Allocation on the hot path is a correctness bug, so it is a gate rather than an intention.
+
+The remote client is inside the arena rather than beside it, because the paths are not as separate as they look. A read miss is the milder case, since reclaim never needs a read. A write normally lands in the cache and is acked without touching the remote at all, but above the throttle watermark it waits for an upload to complete, and dirty pressure and memory pressure arrive together.
 
 `ublk` also supports user recovery, where the daemon can exit and be restarted without tearing down the device or the filesystem above it. That matters because the daemon holds the cache map and the manifest overlay, so without it a restartable process becomes an outage. It does not make a restart free: the cache map is rebuilt from the device in a second or two, but the overlay is rebuilt by replaying deltas from the remote, so a restart blocks I/O for as long as that takes.
 
@@ -56,8 +64,8 @@ HTTP and JSON over a unix socket at `/run/deepdisk/control.sock`, guarded by fil
 Epochs are the currency. Every call that changes durable state returns the epoch it produced and every call that reads it returns the epoch it observed, so a caller can always ask what point in time it is holding, and ask for everything up to now to become durable.
 
 ```
-POST   /v1/volumes                       create with { remote }, or clone with { clone_of }
-GET    /v1/volumes                       list, with size and attach state
+POST   /v1/volumes                       create with { remote }, or fork with { fork_of, at }
+GET    /v1/volumes                       list, with size, attach state and sibling heads
 GET    /v1/volumes/{id}                  epoch, watermark, dirty, device/logical/physical, remote
 DELETE /v1/volumes/{id}                  { limit } -> { deleted, remaining }
 
@@ -79,22 +87,22 @@ GET    /v1/jobs/{id}
 
 `flush` is the call to get right. It commits an epoch and returns its number, and if nothing is dirty it returns the current epoch immediately with `noop: true`, so calling it defensively is free. Concurrent calls coalesce onto one commit and all return the same epoch, which makes it safe to call from several places at once. An explicit flush bypasses the ~1/s root write rate limit, since the caller is asking for a durability point directly. `wait=false` returns as soon as the epoch is assigned, to be paired with `await`.
 
-Clone is a copied root, so it is O(1) and needs no worker at all, just the supervisor copying that one object under a new prefix. Cloning from `"now"` implies a flush first, cloning from a snapshot or an explicit epoch does not. A fork is a clone that is attached, and a restore is a fork at the epoch you want to be at. A clone starts with a cold cache and warms by being read, which is the cost of the whole feature being one object copy.
+Fork writes one head naming an existing root, so it is O(1) and needs no worker at all, just the supervisor issuing a conditional create. Forking from `"now"` implies a flush first, forking from a snapshot or an explicit epoch does not. The new head shares the prefix and every object under it, diverging only as it is written to, so it needs no credentials beyond the ones the origin already had. It starts with a cold cache and warms by being read, which is the cost of the whole feature being a single small put.
 
-Rolling back is that same operation. Every committed epoch stays addressable, so a clone at epoch N is the volume as it stood at N, and attaching it in place of the original is how a volume goes backwards.
+Rolling back is that same operation. Every committed epoch stays addressable, so a fork at epoch N is the volume as it stood at N, and attaching it in place of the original is how a volume goes backwards.
 
-Delete removes a bounded number of objects per call and reports what is left, so an operator paces reclaiming a large volume instead of issuing millions of deletes at once. The head goes first, which makes the volume unmountable from the moment the first call returns, so an interrupted delete is definitively gone rather than mysteriously broken, and every later call is resumable. `--all` loops for the impatient.
+Delete removes the head first, which makes the volume unmountable from the moment the call returns, so an interrupted delete is definitively gone rather than mysteriously broken. Reclaiming what it referenced is then a garbage collection question rather than a prefix walk, since other heads may reach the same objects, and it proceeds a bounded number of objects per call so an operator paces a large reclaim instead of issuing millions of deletes at once. Deleting the last head in a prefix has nothing left to union against, so it degenerates to erasing the prefix. `--all` loops for the impatient.
 
 Detach flushes, commits and tears down, and refuses if it cannot commit, reporting the dirty bytes it would have stranded. `--force` tears down anyway and leaves those blocks in the local cache, where a later attach on the same host resumes uploading them. The danger it protects against is detaching to move a volume elsewhere without noticing that recent writes are still sitting on the machine being left behind, so the amount is always printed rather than inferred.
 
-Recovering to an earlier point is a clone at that epoch, attached in place of the original. The original stays intact until someone deletes it, so going back is non destructive and reversible, and it reaches any epoch the retention window still holds.
+Recovering to an earlier point is a fork at that epoch, attached in place of the original. The original stays intact until someone deletes it, so going back is non destructive and reversible, and it reaches any epoch the retention window still holds.
 
 ### CLI
 
 `deepdisk` is a thin client over that socket, adding no surface of its own.
 
 ```
-deepdisk create <vol> --size 100T [--block-size 4096] --remote s3://bucket/prefix
+deepdisk create <vol> --size 100T [--block-size 4096] --remote s3://bucket/prefix#head
                       --cache /dev/nvme0n1p2 [--cache-size 100G]
                       [--endpoint <url>] [--region <r>] [--addressing path|vhost]
 deepdisk ls                              size and attach state
@@ -114,8 +122,8 @@ deepdisk snap <vol> [--at <epoch>]       -> snapshot, epoch
 deepdisk snaps <vol>                     each with the bytes it pins
 deepdisk snap rm <vol> <snap> --yes
 
-deepdisk clone <src> <dst> [--at <epoch> | --snapshot <id>]
-deepdisk fork <src> <dst>                clone and attach
+deepdisk fork <src> <dst> [--at <epoch> | --snapshot <id>] [--attach]
+deepdisk heads <vol>                     every head over the same prefix
 
 deepdisk compact <vol>                   -> job
 deepdisk jobs [<job>]
@@ -211,7 +219,9 @@ DeepDisk advertises a volatile write cache, so a write is acknowledged once it i
 
 ### Heat and eviction
 
-Eviction follows S3-FIFO, with admission acting on blocks and reclamation acting on regions. Two queues: a small one everything enters, and a main one that repeated use earns.
+Eviction follows S3-FIFO, with admission acting on blocks and reclamation acting on regions. Two of its three queues are carried: a small one everything enters, and a main one that repeated use earns.
+
+The third is not. S3-FIFO's ghost queue holds a fingerprint per unit evicted from small so that a later miss on one can skip straight to main, and at one entry per evicted unit that is a structure roughly the size of the map itself. It answers reuse distances longer than small's residency and shorter than main's, which is a real effect of unmeasured size here, so the eviction structure carries two queues and question 7 is where the third gets decided.
 
 A block's class decides which log it lands in. Each writing thread holds three open regions, small, main and dirty, so a region ends up uniform in heat and can be dropped whole. Everything fetched on demand enters small, which holds ~10% of capacity. A hit sets a two bit counter in the entry, and that is the entire promotion mechanism: nothing is copied at the moment of a hit.
 
@@ -229,7 +239,7 @@ Dirty blocks are exempt, since they are pinned until uploaded. A dirty region is
 
 Dirty pressure is the fraction of regions that are dirty, a count of a few tens of thousands that needs no scan.
 
-Heat lives in the slot table entry and the slot table is materialized from the device, so a worker restart resumes with its working set intact and its counters where it left them. A host with no cache at all, after a migration or a clone, starts cold and warms by being read.
+Heat lives in the slot table entry and the slot table is materialized from the device, so a worker restart resumes with its working set intact and its counters where it left them. A host with no cache at all, after a migration or a fork, starts cold and warms by being read.
 
 ### Flushing
 
@@ -297,17 +307,19 @@ The index that these deltas apply to is checkpointed periodically, so recovery i
 
 Recovery always restores the last committed root. Filesystem flush/FUA barriers are used as epoch boundaries where they land, since they mark points the filesystem itself considers consistent, and a barrier only costs a delta and a root write. Otherwise the epoch is cut on the age cap. Commits are rate limited to ~1/s so a bursty workload cannot commit continuously, and the head swap is conditional, see Fencing below.
 
-#### Snapshots and clones
+#### Snapshots and forks
 
 Immutable segments plus a versioned root make the remote copy-on-write. A write never modifies remote data, it lands in a new segment and the map is repointed, so every committed epoch stays a complete and consistent image for as long as the segments under it survive. The local cache is copy-on-write too, for a different reason and with no history kept: it appends and repoints so that a crash can never leave a block marked clean while holding content that was never uploaded, and the superseded copy is dead the moment the map moves.
 
 That gives us, with no extra machinery:
 
 1. Snapshots, which mark a root as retained along with the delta range it spans. Nothing is copied and nothing moves, so taking one is O(1)
-2. Clones, which are a copied root. Both volumes share every existing segment and only diverge as they are written to
-3. Going back, which is a clone at an older epoch, attached in place of the original
+2. Forks, which are a new head naming an existing root. Both heads reach every segment under that root and diverge only as they are written to
+3. Going back, which is a fork at an older epoch, attached in place of the original
 
-A read only attachment is none of those things. It pins the epoch it mounted and nothing else, so reclamation proceeds underneath it and a reader that outlives the retention window can find content it needs already collected and takes `EIO`. Holding a view for longer than that is exactly what the three above are for: attach `--snapshot`, which pins its segments and its delta range for as long as the snapshot exists, or fork if the view is going to be written to. The alternative, making every reader a retention root, was rejected because a forgotten read only mount would then stop reclamation the same way a forgotten snapshot does, and unlike a snapshot it has no operator visible object to find and no way to signal that it has gone away.
+A fork sharing objects with its origin is why liveness is a union rather than a walk from one root. A segment is dead when no head reaches it and no retained root spans it, so garbage collection reads every head in the prefix and every retention marker, and takes the union. That is the same computation snapshots already require, applied to one more kind of reference, and it is what keeps a fork's data from being collected by whoever happens to run a pass. Concurrent writers on other heads are safe against it for free, since a writer can only reference segments an earlier root already reached or ones it wrote itself, and a pass ignores objects newer than its own start.
+
+A read only attachment is none of those things. It holds the epoch it mounted and nothing else, so reclamation proceeds underneath it and a reader that outlives the retention window can find content it needs already collected and takes `EIO`. Holding a view for longer than that is exactly what the three above are for: attach `--snapshot`, which retains its root and delta range for as long as the snapshot exists, or fork if the view is going to be written to. The alternative, making every reader a retention root, was rejected because a forgotten read only mount would then stop reclamation the same way a forgotten snapshot does, and unlike a snapshot it has no operator visible object to find and no way to signal that it has gone away.
 
 #### Failure and garbage
 
@@ -352,50 +364,51 @@ Packs accumulate dead pages as those pages are superseded, so packs need livenes
 
 ### Layout
 
-Everything is immutable except `meta/head`:
+Everything is immutable except the heads:
 
 ```
-data/seg/000000A1F3              4MB immutable segment, self describing
-data/seg/000000A1F4
+data/seg/9F3A1C77B204E815        4MB immutable segment, self describing
+data/seg/2B84D0FE61A9C33D
 
-meta/pack/00000012               index pages written by checkpoint @ epoch 41200
-meta/pack/00000013               index pages written by checkpoint @ epoch 42200
+meta/pack/7C1E05B8AA42F961       index pages written by checkpoint @ epoch 41200
+meta/pack/D3902A6F58E1740B       index pages written by checkpoint @ epoch 42200
 
 meta/delta/0000000000042801      ~1KB, one per epoch
 meta/delta/0000000000042802
    ...
 meta/delta/0000000000042847
 
-orphan/42847/3f2ab19c/           a fenced writer's last writes, root and segments
+orphan/main/42847/3f2ab19c/      a fenced writer's last writes, root and segments
 
 meta/super                       { uuid, format_version, block_bytes: 4096 }
 
 meta/root/0000000000042847       { epoch: 42847,
                                    writer_id: "3f2ab19c",
-                                   tree: (pack 13, off 8192, len 3400),
+                                   tree: (pack D3902A6F58E1740B, off 8192, len 3400),
                                    tree_bytes: 1046528,
                                    checkpoint_epoch: 42200,
                                    delta_from: 42801,
-                                   next_segment: 42112,
-                                   next_pack: 14,
                                    device_bytes: 109951162777600,
                                    logical_bytes: 8246337208320,
                                    physical_bytes: 11338713397657 }
 
-meta/head                        { epoch: 42847 }
+meta/head/main                   { epoch: 42847 }
+meta/head/dev-fork-1             { epoch: 42800 }
 ```
 
-Roots are immutable and written one per epoch, and `meta/head` is the only mutable object in the volume. Committing is a create of the root followed by a compare and swap of the head, so the head is what fencing contends on and it stays small enough that the check is a few bytes. Every epoch that ever committed is still addressable, which is what snapshots and point in time recovery reach for.
+Roots are immutable and written one per epoch, and the heads are the only mutable objects. Committing is a create of the root followed by a compare and swap of one head, so a head is what fencing contends on and it stays small enough that the check is a few bytes. Every epoch that ever committed is still addressable, which is what snapshots and point in time recovery reach for.
+
+A prefix holds one object store and any number of heads over it, so a volume is a prefix and a head name rather than a prefix alone. Heads are peers: none is the original, each advances on its own epochs, and each has its own CAS, so two writers on different heads never contend while two on the same head fence each other exactly as before. Roots, segments and packs are shared by whichever heads reach them, and nothing is copied to create that sharing.
+
+Segment and pack IDs are random 64 bit values. Heads advance independently, so no counter can be shared between them, and a randomly drawn ID collides at a rate that never matters while a conditional create catches the case anyway. They carry no meaning and nothing sorts by them: garbage collection ranks segments by live count, and every reference to one is explicit in a delta or a page, so nothing has to guess a key.
 
 Keys are deterministic, and the root records the current checkpoint plus the live delta range, so we never list a prefix to find objects. Listing is only for garbage collection and repair.
 
 Because keys are deterministic, no bucket lifecycle rule may be applied to a volume prefix. A segment is written once and then only read, so age says nothing about whether it is live, and a routine expiry policy would delete data a current root still points at.
 
-`next_segment` and `next_pack` are high water marks rather than last used values. Segments are uploaded before the commit that references them, so a writer draws IDs from a reserved range below the mark and a commit advances the mark past what the next interval will need. A crash leaves a gap of unused IDs, which costs nothing since IDs are opaque, and a restart resumes at the recorded mark, which is already beyond anything the previous incarnation could have issued.
+Creating a volume writes `meta/super`, then `meta/root/0` describing an empty tree, then `meta/head/{name}` at epoch 0. Every step is a conditional create, which makes the whole sequence idempotent: a create interrupted halfway is completed by running it again, and two concurrent creates resolve to one winner, with the loser finding `meta/super` already present and comparing it to decide whether it agrees. A volume is mountable only once its head exists, so a partial create reads as absent rather than as broken.
 
-The mark is an optimisation rather than a correctness requirement, because a conditional create that finds someone else's key is resolved by drawing the next ID, see Fencing. Without the mark a restart would rediscover its predecessor's IDs one wasted round trip at a time, and a writer that exhausts its reserved range before the next commit does the same, which is the case to watch under a dirty pressure burst that seals segments faster than the interval expected.
-
-Creating a volume writes `meta/super`, then `meta/root/0` describing an empty tree, then `meta/head` at epoch 0. Every step is a conditional create, which makes the whole sequence idempotent: a create interrupted halfway is completed by running it again, and two concurrent creates resolve to one winner, with the loser finding `meta/super` already present and comparing it to decide whether it agrees. A volume is mountable only once the head exists, so a partial create reads as absent rather than as broken.
+Forking is that same last step on its own. A new head is a conditional create naming a root that already exists, so it is one small put, it copies nothing, and it is O(1) in the size of the volume rather than merely cheap. Creating a fork and creating a volume differ only in whether the root it names is empty.
 
 `meta/super` is written once at creation and never again. Block size cannot change without invalidating every mapping in the volume, so it lives in an object that nothing is allowed to rewrite, and is validated on mount.
 
@@ -403,7 +416,7 @@ The root carries the sizes because they change with the epoch and have to be ato
 
 1. `device_bytes`, the capacity presented to Linux. Keeping it here makes an online grow a normal epoch commit rather than separate mutable state that can disagree with the manifest, and it means a volume mounted on another host needs nothing out of band. It must never shrink below the highest mapped block
 2. `logical_bytes`, the address space actually written. This is the thin provisioned used figure, and is what a bottomless device reports as consumed rather than `device_bytes`
-3. `physical_bytes`, total bytes stored remotely, garbage and metadata objects included. This is the bill, so it counts dead regions inside segments right up until compaction reclaims them, and it counts packs, deltas and merges
+3. `physical_bytes`, total bytes stored under the prefix, garbage and metadata objects included. This is the bill, so it counts dead regions inside segments right up until compaction reclaims them, and it counts packs and deltas. It is a property of the prefix rather than of one head, so every head over a store reports the same figure and it is never double counted across forks. What differs per head is how much of it that head alone reaches, which is reported beside it
 
 The gap between the last two is what deferring compaction costs, so a pass can be scheduled from two numbers in the root without scanning segments or walking the tree. All three are maintained incrementally, since recomputing them means a full scan.
 
@@ -431,7 +444,7 @@ PUT data/seg/...            the segment
 apply to the overlay        in memory, no leaves touched
 PUT meta/delta/N            the delta
 PUT meta/root/N             { epoch: N, tree: <unchanged>, delta_from: M+1 }
-CAS meta/head               { epoch: N } if it still holds N-1
+CAS meta/head/{name}        { epoch: N } if it still holds N-1
 mark blocks clean
 ```
 
@@ -457,7 +470,7 @@ Delta and checkpoint are the two tiers, and a mount replays the delta range whol
 Mount:
 
 ```
-GET meta/head then meta/root/{epoch}   two small sequential gets
+GET meta/head/{name} then the root     two small sequential gets
 GET the root page                      range get into its pack
 GET meta/delta/{delta_from..epoch}     in parallel, up to 1000 small objects
 replay them into an overlay
@@ -529,7 +542,7 @@ A write concurrent with a read of the same block is not ordered by the block lay
 
 One flusher per volume. Packing, uploading and committing are serial with respect to each other by the single writer rule, uploads are concurrent within an epoch, and the only genuinely serial step in the system is the head swap. Everything else scales with threads.
 
-All of it is preallocated and locked. The slot table, the forward index, the region buffers and the request pool are sized at startup from the cache device and never grow, which is what makes `PR_SET_IO_FLUSHER` and `mlockall` an enforceable claim rather than an aspiration. The S3 and TLS path is the exception worth naming: a general purpose HTTP client allocates per request, and on the writeback path that is the reclaim deadlock the daemon exists to avoid, so the remote client draws from a fixed arena with a bounded number of in flight requests and no allocator behind it.
+All of it is preallocated and locked. The slot table, the forward index, the region buffers and the request pool are sized at startup from the cache device and never grow, and everything that does allocate, the remote client included, draws from the process arena described in Device. In flight remote requests are bounded so the arena can be sized against them.
 
 ## Discard
 
@@ -547,29 +560,43 @@ Unmapping commits like a write, as an entry in the epoch delta, so a discard is 
 
 The S3 API is the interface and no provider behind it is assumed.
 
-A volume's identity is its bucket and prefix, fixed at creation. How a host reaches that bucket is not, so endpoint, region, addressing, TLS trust and credentials are supplied to create and attach and hold for the life of the attachment. Both calls exercise them before returning, writing a `_deepdisk` probe object under the prefix and deleting it, or listing instead when the attach is read only. Credentials are held in memory and never returned by a get, the rest comes back from `GET /v1/volumes/{id}`.
+A volume's identity is its bucket, prefix and head name, fixed at creation. A prefix holds one object store and every head over it, so forks of a volume share an identity down to the last component and share credentials with it exactly. How a host reaches that bucket is not part of the identity, so endpoint, region, addressing, TLS trust and credentials are supplied to create and attach and hold for the life of the attachment. Both calls exercise them before returning, writing a `_deepdisk` probe object under the prefix and deleting it, or listing instead when the attach is read only. Credentials are held in memory and never returned by a get, the rest comes back from `GET /v1/volumes/{id}`.
 
-A 403 after a successful attach means revoked or expired rather than unlucky, so it is logged as an event immediately instead of disappearing into upload retries, and uploads then fail into the watermark ladder as any unreachable remote does. A read only attach needs get and list alone, which makes that flag enforceable at the boundary rather than only by us. A clone reads its source's prefix as well as its own, so its credentials have to cover both.
+A 403 after a successful attach means revoked or expired rather than unlucky, so it is logged as an event immediately instead of disappearing into upload retries, and uploads then fail into the watermark ladder as any unreachable remote does. A read only attach needs get and list alone, which makes that flag enforceable at the boundary rather than only by us. A fork reads and writes the same prefix its origin does, so one credential covers every head over one object store, and access cannot be granted per head.
 
 Credentials are assumed to be long lived, and that is a limitation rather than an oversight. DeepDisk does not obtain or refresh them: there is no STS assume role, no IMDS, no container identity provider and no refresh timer, so an attachment is only as durable as the credentials it was given, and short lived session credentials will expire underneath a running volume and walk it up the watermark ladder to a stall. An attachment is expected to outlive its credentials only if those credentials do not expire.
 
 Rotation is still a thing operators do, so `POST /v1/volumes/{id}/credentials` re-supplies them on a live attachment. It exercises the new values against the prefix the same way attach does, replaces them in memory only on success, and takes effect on the next request without disturbing I/O, so rotating a key does not mean a detach and attach cycle. Automatic refresh is the obvious thing to build on top of it and is out of scope here.
 
+Encryption is out of scope, and it composes rather than being missing. A deployment that needs client held keys puts `dm-crypt` between the filesystem and `/dev/deepdisk0`, so DeepDisk sees ciphertext blocks and never sees a key; one that needs encryption at rest against the storage provider turns on SSE-S3 or SSE-KMS on the bucket, which also covers the `meta/` objects `dm-crypt` cannot reach. Both are standard, both are someone else's problem to get right, and holding keys is a liability worth not taking on. Object formats carry a version field so this can be revisited, but nothing is reserved for it.
+
 Five operations are required: range get, put with conditional create, put conditional on the current version for the head swap, delete, and list by prefix. Conditional support is the discriminator, and a backend that accepted the header and ignored it would break fencing silently. So create reuses `_deepdisk` for it, writing the key twice and then replacing against a stale version, expecting refusal both times and refusing the volume otherwise. Paying that cost once is what lets every later write assume it.
 
 ## Integrity
 
-S3 checksums on upload, verifies at rest and repairs from redundancy, so object bit rot is its problem and DeepDisk uses its native CRC32C rather than duplicating it. Two things sit outside that reach.
+Two layers check different failures and neither substitutes for the other.
+
+The object layer belongs to S3. It checksums on upload, verifies at rest and repairs from redundancy, so object bit rot is its problem, and DeepDisk supplies CRC32C in the API's own checksum field rather than wrapping an object in a second scheme of its own. Two things sit outside that reach.
 
 The local cache is the durability boundary, holding acked data before it exists remotely at all and clean data indefinitely. Device ECC catches most of what goes wrong there, but a misdirected write lands a block at the wrong LBA and produces one that is internally consistent and simply wrong.
 
-The larger surface is our own. DeepDisk translates addresses, so a delta that encodes an extent off by one, or a leaf that decodes wrong after compaction, returns another block's data: intact, correctly checksummed, and not what was asked for.
+The larger surface is our own translation. DeepDisk maps addresses, so a delta that encodes an extent off by one, or a leaf that decodes wrong after compaction, returns another block's data: intact, correctly checksummed by S3, and not what was asked for.
 
-Both are covered by checksumming `(block_index || data)` rather than the data alone, which turns a bit rot check into a misdirection check, since reading block 500 and receiving block 900 fails even though block 900 is intact. CRC32C is 4 bytes per 4K block, 0.1%, and a hardware instruction.
+The block layer covers both, by checksumming `(block_index || data)` rather than the data alone, which turns a bit rot check into a misdirection check: reading block 500 and receiving block 900 fails even though block 900 is intact. CRC32C is 4 bytes per 4K block, 0.1%, and a hardware instruction.
 
-Checksums travel with the data and never enter the manifest, where per block entries would break extent encoding and cost ~1GB per TB. A segment carries them at a fixed stride alongside each slot. On local disk the durable copy is in the region metadata area, next to the block index it protects, and the working copy is in the slot table entry that the lookup has already loaded, so verifying a cache hit adds no request, no seek and no extra cache line.
+There is one such checksum per block and it is computed once, when the block value first exists, then carried. A block written locally is checksummed as it enters the cache and the segment that later ships it reuses that value; a block fetched from a segment arrives with its checksum and keeps it. Verification happens many times, computation once.
 
-That holds at one block per map entry, which is the working set case. Above it the coverage thins deliberately: per block checksums stay in the region metadata area, the unit is verified end to end when it is filled, and a later hit is covered by the block index comparison and by the drive's own ECC. Verifying a 4K read against a checksum over a 256KB unit would cost a 256KB read, and reading a metadata block per hit would double the I/O the cache exists to avoid, so a coarse map buys its capacity partly with verification depth. Manifest pages carry their own over `(page identity || content)`, since a corrupted leaf misdirects everything beneath it.
+It is stored wherever a reader needs it, which is three places holding one value:
+
+1. In a segment, at a fixed stride alongside each slot, for a block arriving from the remote
+2. In the region metadata area on the cache device, the durable local copy, which is what recovery validates slots against
+3. In the slot table entry in RAM, so verifying a cache hit costs no request, no seek and no extra cache line
+
+The third is a cache of the second rather than an independent check, and it is why the map entry carries 4 bytes it could otherwise skip. Reading the device copy on every hit would mean a second 4K read for each one the cache serves, which is the cost the cache exists to remove.
+
+Checksums never enter the manifest, where per block entries would break extent encoding and cost ~1GB per TB.
+
+Verifying every hit this way holds at one block per map entry, which is the working set case. Above it the coverage thins deliberately: per block checksums stay in the region metadata area, the unit is verified end to end when it is filled, and a later hit is covered by the block index comparison and by the drive's own ECC. Verifying a 4K read against a checksum over a 256KB unit would cost a 256KB read, and reading a metadata block per hit would double the I/O the cache exists to avoid, so a coarse map buys its capacity partly with verification depth. Manifest pages carry their own over `(page identity || content)`, since a corrupted leaf misdirects everything beneath it.
 
 A clean block that fails verification is discarded and refetched, so local corruption self heals and the read still completes. A dirty block that fails is real loss, since it was never uploaded, and returns `EIO`.
 
@@ -585,7 +612,7 @@ At the top of the watermark ladder the stall is held indefinitely, because the d
 
 Running one writer is the application's guarantee to make, and it is the operational requirement DeepDisk places on whoever deploys it. What follows detects a second writer and contains it. It does not make concurrent mounts work, and it does not recover what the second writer costs, so an orchestrator that fails over on unreachability alone will eventually lose data here. Unreachable and dead are different states, and only the deployment can tell them apart.
 
-Fencing lives entirely on the remote and the epoch is the token. Every head swap is conditional on the head still holding the epoch this writer last committed, so two writers advancing from the same epoch resolve into one winner and one conditional failure. `writer_id` is a fresh 128 bit value per incarnation, so it never repeats and a writer can always recognise its own bytes.
+Fencing lives entirely on the remote and the epoch is the token. Every head swap is conditional on that head still holding the epoch this writer last committed, so two writers advancing the same head from the same epoch resolve into one winner and one conditional failure. Writers on different heads never contend at all, since each swaps its own object. `writer_id` is a fresh 128 bit value per incarnation, so it never repeats and a writer can always recognise its own bytes.
 
 Every object is a conditional create as well, since keys are deterministic and a second writer computes them identically, and under last write wins the winner's committed epoch could otherwise point at the loser's bytes. What a create conflict means depends on how the key was chosen, because fencing belongs where two writers necessarily contend on the same key rather than where they collide by accident. Segments and packs draw from a shared ID space and so use *different* keys from it, and a writer that fenced on those would have writer A take `A1F4` while B takes `A1F5` and each then fence itself on the other's key, leaving the volume with no one serving it.
 
@@ -599,9 +626,9 @@ A head swap whose response is lost is not a fence either. The writer re-reads th
 
 Segments a fenced writer uploaded before losing are left behind under `data/seg/`, referenced by no root. Garbage collection reclaims them on liveness like any other dead object, which is the correct treatment because they genuinely are dead. This is the one case where an unreferenced segment is expected rather than a symptom.
 
-The loser holds an invalid copy. Not a stale one that could be caught up and not a divergent one that could be merged, since its blocks were written against allocation state the winner never saw. So it flushes its dirty blocks to `orphan/{epoch}/{writer_id}/`, fails outstanding and subsequent I/O with `EIO`, and drops the mount. Once fenced it never reads the root again, which is the one step that would turn a fence back into a race, and this is why the head read above is scoped to an in flight swap whose outcome is unknown rather than being a general retry. That prefix holds a private root and its segments, so an operator can clone it into a separate volume and pull files out by hand. It is never applied onto the winner. Garbage collection also never touches it, since its liveness rules would read an unreferenced root as dead, so the prefix stays until an operator removes it and a split brain leaves a trace that does not expire on its own.
+The loser holds an invalid copy. Not a stale one that could be caught up and not a divergent one that could be merged, since its blocks were written against allocation state the winner never saw. So it flushes its dirty blocks to `orphan/{head}/{epoch}/{writer_id}/`, fails outstanding and subsequent I/O with `EIO`, and drops the mount. Once fenced it never reads the root again, which is the one step that would turn a fence back into a race, and this is why the head read above is scoped to an in flight swap whose outcome is unknown rather than being a general retry. That prefix holds a private root and its segments, so an operator can point a head at it and pull files out by hand. It is never applied onto the winner. Garbage collection also never touches it, since its liveness rules would read an unreferenced root as dead, so the prefix stays until an operator removes it and a split brain leaves a trace that does not expire on its own.
 
-The same rule runs at mount, since a writer can be fenced and then crash before acting on it. An ordinary restart keeps its cache, because the dirty blocks there are acknowledged writes that have not been uploaded, so one number separates the two cases: the cache superblock records the epoch it is working toward, written before the root put, which holds it at or ahead of the root for a legitimate writer even when a crash lands between them. A head ahead of the cache means another writer committed, and the whole cache is orphaned and dropped, since entries are keyed by block index and the winner may have rewritten any of them. This depends on the epoch being strictly monotonic for the life of a volume, which it is: a clone at an older epoch starts a new prefix with a head of its own, so the source's head only ever moves forward.
+The same rule runs at mount, since a writer can be fenced and then crash before acting on it. An ordinary restart keeps its cache, because the dirty blocks there are acknowledged writes that have not been uploaded, so one number separates the two cases: the cache superblock records the epoch it is working toward, written before the root put, which holds it at or ahead of the root for a legitimate writer even when a crash lands between them. A head ahead of the cache means another writer committed, and the whole cache is orphaned and dropped, since entries are keyed by block index and the winner may have rewritten any of them. This depends on the epoch being strictly monotonic for the life of a head, which it is: a fork at an older epoch advances a head of its own, so no head ever moves backwards.
 
 This protects the integrity of the remote. Two writers can never produce a torn or interleaved image, and a zombie serving reads mutates nothing. The flush window is separate: the writes the loser acknowledged and had not yet uploaded are unreachable from the winner, so split brain converts the age cap from an RPO window into a data loss window and one knob bounds both. Surviving a host means uploading, and fencing is orthogonal to it.
 
@@ -646,6 +673,30 @@ Some conditions matter more than any gauge and are logged as events as well as e
 
 Prometheus text at `GET /v1/metrics` on the control socket, labelled by volume, which is what `deepdisk metrics` prints.
 
+## Verification
+
+A block device fails by returning the wrong bytes, quietly, to a filesystem that trusts it. Everything in this document that argues an epoch commit is atomic, that a fence resolves to one winner, or that a crash loses only what was never barriered, is prose until something mechanically tries to break it. Two harnesses do that, and they answer different questions.
+
+### Deterministic simulation
+
+The whole daemon runs inside a simulated world driven by one seed. Every source of nondeterminism is injected rather than ambient: the clock, the cache device, the remote, thread interleaving and the completion order of everything in flight. A run is then a pure function of its seed, so a failure found on seed 91,824,663 is reproduced exactly by replaying it, and a fix is verified against the same seed rather than against the absence of a recurrence.
+
+The simulated cache device is an adversary rather than a mock. It reorders completions, tears writes at sector boundaries, loses everything not flushed, corrupts blocks at chosen rates and cuts power between any two operations, including between a data write and the metadata block that describes it. The simulated remote is the same: arbitrary latency, request reordering, 500s and 503s, throttling, conditional create races, and the response to a head swap being lost after the swap has already taken effect.
+
+A reference model runs beside it, a plain map of block index to bytes, along with the set of states a crash could legally leave. The checker asserts after every operation that what the device returns is what the model holds, and after every crash that it is one of the states the model permits. That is what turns "recovery restores the last committed root" from a claim into a property.
+
+What it is aimed at, in order of how much it would cost to find in production: a crash at any point in the commit sequence, two writers racing the same head through conditional creates and a CAS whose outcome is unknown, cache recovery from partially written region metadata, unmap ordering inside an epoch, and the watermark ladder under a remote that has stopped answering.
+
+This constrains the architecture rather than testing it afterwards, in the same way the allocation arena does. Nothing may read a clock, spawn a thread or open a socket except through an interface the simulator can substitute. Retrofitting that is a rewrite, so it is a rule from the first commit.
+
+### Trace replay
+
+Correctness is what simulation settles. Hit rate is what decides whether the product's claim is true at all, and it wants real traces rather than synthetic ones.
+
+The eviction policy runs standalone against captured block traces, with no daemon, no kernel and no remote, reporting hit rate against cache size. Public block traces are captured at the block layer and are therefore already the post page cache miss stream DeepDisk sees, which is the awkward part of measuring a second level cache and is already solved.
+
+It is cheap and it comes first, because it is the only experiment that can report a result before anything is built, and the only one whose answer could say the design is wrong rather than mistuned. It settles `small_queue`, whether the ghost queue earns a structure the size of the map, where the `map_unit` crossover sits and how much relocation a given `region_bytes` costs, which is four of the open questions below from one harness.
+
 ## Configuration
 
 ```
@@ -653,7 +704,7 @@ volume, fixed at creation
   block_bytes           4096      changing it invalidates every mapping
   leaf_blocks           4096      manifest leaf coverage, 16MB of address space
   cache_device          -         raw device or partition
-  remote                -         bucket and prefix, the volume's identity
+  remote                -         bucket, prefix and head name, the volume's identity
 
 remote access, supplied per attach
   endpoint              -         any host speaking the S3 API
@@ -706,10 +757,11 @@ Nothing in this table sets the daemon's memory footprint directly, because it is
 1. Compaction now has an owner and a priority, but not a trigger. `physical_bytes` over `logical_bytes` gives the garbage ratio without scanning anything, and the ratio at which a pass is worth running is unset, as is how that interacts with the retention window keeping the garbage alive
 2. Snapshot liveness is a union across retained roots, fine for a handful and expensive at hundreds. Liveness may need to be tracked per snapshot, or snapshot count may need a bound
 3. Leaf size is fixed at 4096 blocks, which makes a dense leaf 24KB, and that one number drives two costs. A checkpoint over a badly fragmented region writes roughly 6x the bytes that changed, and it rules out a key value backend like FoundationDB, which recommends values under ~10KB and would otherwise be attractive for mount time and for the RPO floor that rate limiting root writes imposes. Leaf size should be tunable, and the dense threshold may want to split a leaf rather than densify it
-4. Compression and encryption are unaddressed. Both belong at the segment boundary, which is also where they collide with range gets, since a read fault has to decrypt and decompress a slice rather than the whole object. This has to be settled before the object formats are frozen rather than after, because it changes the layout of the one object type that is written most
+4. Compression is unaddressed. It belongs at the segment boundary, which is also where it collides with range gets, since a read fault has to decompress a slice rather than the whole object. Encryption above rules it out in practice, since ciphertext does not compress, so this is only worth taking up for a deployment that has chosen not to encrypt
 5. Roots and their deltas accumulate at one per epoch, so something has to expire them. A retention window bounds it, ~8,600 roots and deltas a day at 10s epochs, a few tens of MB, but the window and whether it is time or count based are unset. It is now load bearing beyond storage cost, since it is also the bound on how long a read only attachment can outlive reclamation before it takes `EIO`
-6. Clones share segments across volume prefixes and nothing refcounts them. A volume's garbage collection has to account for roots in other volumes that reference its objects, and deleting a source volume would currently destroy every clone taken from it. `physical_bytes` also double counts shared segments across a clone pair, so it stops being the bill the moment a volume is cloned
-7. Hit rate is unmeasured. The eviction structure is chosen on the shape of the workload rather than on numbers from it, and the small queue size is a guess until there are traces to tune against. S3-FIFO's ghost queue, which remembers what small evicted so a later miss can skip straight to main, would cost a structure roughly the size of the map and is the first thing to weigh once those traces exist
+6. Heads over one prefix cannot be separated. Access is granted per prefix, so a fork cannot be handed to someone the origin is withheld from, and moving a fork to another bucket means materialising it by copying everything it reaches. Both are the price of sharing objects rather than copying them, and whether a `promote` that materialises a head into a prefix of its own is worth building is unanswered
+7. Hit rate is unmeasured. The eviction structure is chosen on the shape of the workload rather than on numbers from it, and the small queue size is a guess until trace replay has run. Whether the ghost queue earns a structure the size of the map is the first thing it should settle
 8. Region size trades reclamation granularity against relocation cost and 32MB is a guess. Too large and a region comes up for reclaim holding survivors worth copying; too small and the region table and the per region metadata overhead grow. Bytes relocated per second is the metric that settles it and there is nothing to measure yet
 9. `map_unit` auto sizing picks one granularity for a whole device, which is a single compromise for any workload that is bulk in one file and random in another, and 3% of host memory is a guess at the budget. Typing regions by granularity as well as by class would resolve it, promoting a proven hot block out of a coarse region into a finely mapped one, but the promotion policy, the split between the two pools and whether the win justifies two mapping paths on the read path are all undesigned
-10. Cold start after a fork or a migration is unmeasured. A clone warms by being read, and whether that is fast enough decides if a published working set summary and a prefetcher to consume it are worth their own object, encoding and budget
+10. Cold start after a fork or a migration is unmeasured. A fork warms by being read, and whether that is fast enough decides if a published working set summary and a prefetcher to consume it are worth their own object, encoding and budget
+11. The map entry carries a checksum only because the durable copy on the device cannot be read without a second I/O. A drive formatted with per LBA protection information returns data and its guard in one command, which would take the entry to 7 bytes, ~2.5GB per TB, with hardware checking and a reference tag that catches misdirection natively. It is strictly better where it exists and it is a hardware requirement rather than an option, so the question is whether requiring that class of drive is acceptable
