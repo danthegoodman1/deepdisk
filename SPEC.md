@@ -446,6 +446,20 @@ Discards arrive in floods, since `fstrim` releases everything a filesystem is no
 
 Unmapping commits like a write, as an entry in the epoch delta, so a discard is durable only once its epoch commits and is never visible remotely ahead of the root that records it.
 
+## Integrity
+
+S3 checksums on upload, verifies at rest and repairs from redundancy, so object bit rot is its problem and DeepDisk uses its native CRC32C rather than duplicating it. Two things sit outside that reach.
+
+The local cache is the durability boundary, holding acked data before it exists remotely at all and clean data indefinitely. Device ECC catches most of what goes wrong there, but a misdirected write lands a block at the wrong LBA and produces one that is internally consistent and simply wrong.
+
+The larger surface is our own. DeepDisk translates addresses, so a delta that encodes an extent off by one, or a leaf that decodes wrong after compaction, returns another block's data: intact, correctly checksummed, and not what was asked for.
+
+Both are covered by checksumming `(block_index || data)` rather than the data alone, which turns a bit rot check into a misdirection check, since reading block 500 and receiving block 900 fails even though block 900 is intact. CRC32C is 4 bytes per 4K block, 0.1%, and a hardware instruction.
+
+Checksums travel with the data and never enter the manifest, where per block entries would break extent encoding and cost ~1GB per TB. A segment carries them at a fixed stride alongside each slot, and on local disk they sit beside the block inside its granule, so verifying adds no request and no seek. Manifest pages carry their own over `(page identity || content)`, since a corrupted leaf misdirects everything beneath it.
+
+A clean block that fails verification is discarded and refetched, so local corruption self heals and the read still completes. A dirty block that fails is real loss, since it was never uploaded, and returns `EIO`.
+
 ## Errors
 
 Reads and writes fail differently, because the truth is in different places. A write is durable locally the moment its barrier completes, so an unreachable remote costs us space rather than data, and the response is to accumulate dirty blocks and walk up the watermarks. A read that misses the local cache has no local truth to fall back on, so for it an unreachable remote is a real failure.
