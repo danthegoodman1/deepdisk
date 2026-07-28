@@ -103,13 +103,14 @@ Recovering to an earlier point is a fork at that epoch, attached in place of the
 
 ```
 deepdisk create <vol> --size 100T [--block-size 4096] --remote s3://bucket/prefix#head
-                      --cache /dev/nvme0n1p2 [--cache-size 100G]
+                      --cache /dev/nvme0n1p2 [--cache-size 100G] [--map-unit 64K]
                       [--endpoint <url>] [--region <r>] [--addressing path|vhost]
 deepdisk ls                              size and attach state
 deepdisk status <vol>                    epoch, watermark, dirty, device/logical, usage as of
 deepdisk rm <vol> --yes [--limit N] [--all]
 
 deepdisk attach <vol> [--read-only] [--snapshot <id>] [--cache-size 100G]
+                      [--format-cache [--map-unit 64K]]
                       [--endpoint <url>] [--region <r>] [--addressing path|vhost] [--ca <path>]
 deepdisk detach <vol> [--force]
 deepdisk credentials <vol>               re-supply on a live attachment
@@ -776,6 +777,8 @@ Credentials are missing from this table on purpose. They belong to the attach th
 The fixed settings are fixed for different reasons. `block_bytes` is recorded in `meta/super` and validated on mount, since every mapping in the volume is expressed in it, and `leaf_blocks` is structural in the remote, so changing it means rebuilding rather than setting a flag. `region_bytes` and `map_unit` are recorded in the cache superblock and are local only, so changing them means reformatting the cache device, which costs a cold cache and nothing else. `cache_bytes` sits in the same group but moves freely, since using fewer or more regions of a device changes no layout.
 
 Nothing in this table sets the daemon's memory footprint directly, because it is derived: `cache_bytes / map_unit` entries at ~15 bytes each, allocated and locked at startup. `map_ram` is the constraint that picks `map_unit` rather than the other way around, which is what keeps the footprint a decision rather than a consequence of buying a bigger cache device.
+
+Both terms are also how it comes down when a device moves to a host with less memory and attach refuses. `--cache-size` is the usual answer, needing no reformat and bringing the regions below the new mark back warm, at the cost of capacity. `--format-cache --map-unit` keeps the capacity mapped and costs a cold cache, the read amplification above and the residency the completeness rule denies a sub-unit write. Neither is a live change, since the map is sized and locked at attach, and both refuse while the device still holds dirty blocks.
 
 ## Open questions
 
