@@ -137,7 +137,7 @@ The local and remote designs are deliberately different.
 
 There is no copy-on-write radix tree, checkpoint overlay, per-cache-block RAM
 map, global eviction queue, product snapshot history, remote LSM, or
-concurrent remote collector.
+full-volume stop-the-world collector.
 
 ## 4. Linux device behavior
 
@@ -204,14 +204,14 @@ The formatted space contains:
 1. two alternating superblocks and small control logs;
 2. a circular durable write journal;
 3. a persistent clean data cache and its tag pages;
-4. maintenance scratch and emergency journal reserve.
+4. one emergency segment-repack scratch region.
 
 Defaults are:
 
 ```text
 region_bytes             64 MiB
 journal_bytes            min(max(5% of cache_bytes, 8 GiB), 16 GiB)
-maintenance_bytes        min(max(0.5% of cache_bytes, 1 GiB), 4 GiB)
+repack_scratch_bytes     64 MiB
 journal_reserve_regions  2
 clean_bytes              all remaining formatted space
 manifest_disk_bytes      required explicit quota, at least 8 GiB
@@ -673,6 +673,11 @@ RocksDB is configured with partitioned indexes and filters charged to its
 at most 4 MiB of memtables, and bounded background concurrency.
 The engine may not pin all indexes or filters in RAM.
 
+Garbage discovery streams candidate records into RocksDB through bounded
+write batches. Audit and repack scans share the 8 MiB remote-work arena. Only
+the next deletion batch's at-most-256 targets may be retained there; larger
+per-slice object limits are disk-work bounds, not in-memory arrays.
+
 The kernel's ublk request structures and the process's TLS and code pages are
 reported separately. DeepDisk exports RSS, locked bytes, and every arena's
 committed and peak bytes.
@@ -684,6 +689,7 @@ committed and peak bytes.
 The backend must provide:
 
 - strongly consistent `GET`, `HEAD`, `PUT`, `DELETE`, and `LIST`;
+- paginated `LIST` in bytewise key order with an exclusive start-after key;
 - byte-range `GET`;
 - conditional replacement with exact ETag comparison;
 - request and response checksums for uploaded objects;
@@ -759,7 +765,7 @@ logical block remains in the higher-priority journal. A repacking commit does
 not change logical bytes, and its old segments remain available until local
 application and read-pin drain.
 
-There are three column families:
+There are four column families:
 
 ```text
 extents
@@ -770,9 +776,13 @@ segments
   key:   segment_id u128
   value: total_slots, live_slots, object_bytes, creation_commit
 
+garbage
+  key:   canonical remote object key
+  value: object type, exact bytes, accounted flag, reason, unreachable revision
+
 control
   key:   singleton names
-  value: volume UUID, applied commit, last observed head revision
+  value: volume UUID, applied commit, last observed head revision, scan cursors
 ```
 
 The extent keyspace is canonical and non-overlapping. Consecutive logical
@@ -785,11 +795,21 @@ Each committed remote delta contains sorted, coalesced mapping runs. The local
 applier edits overlapping extents in one RocksDB `WriteBatch`: an overwritten
 extent is deleted and any unaffected left or right remainder is reinserted.
 New and surviving neighbors are merged whenever they name consecutive slots
-of the same segment. The same batch adjusts exact per-segment live-slot counts
-and advances the applied commit and head revision. The batch uses a synced
-RocksDB WAL before DeepDisk records local coverage or reclaims journal data.
-Only this serialized applier writes the database, so no database transaction
-layer is needed.
+of the same segment. The same batch adjusts exact per-segment live-slot counts,
+queues a segment whose count becomes zero in `garbage`, and advances the
+applied commit and head revision. Checkpoint installation similarly queues the
+old catalog, absorbed commits, and old checkpoint blobs not shared with the
+new catalog. These records are exact deletion candidates, not liveness
+authority; every candidate is revalidated before deletion. Losing a candidate
+can leak remote space but cannot lose live data. Candidate insertion is
+best-effort and the encoded queue is capped at 64 MiB. If that cap is reached,
+or if a conservative local reservation would consume manifest emergency
+space, DeepDisk omits the candidate and relies on a later audit. Host
+writeback is never blocked solely to preserve a remote-deletion hint.
+
+The batch uses a synced RocksDB WAL before DeepDisk records local coverage or
+reclaims journal data. Only this serialized applier writes the database, so no
+database transaction layer is needed.
 
 A process-local manifest generation increments after each applied batch. Reads
 that observe a generation change repeat their mapping lookup. RocksDB
@@ -901,8 +921,9 @@ Checkpoint publication is:
    new catalog with `base_commit = N`, leave `last_commit = N`, account new
    bytes, reset retained commit count and bytes to zero, and release unused
    reservation.
-6. Retain the new checkpoint locally and make the old base catalog and commit
-   objects through N eligible for garbage collection.
+6. Retain the new checkpoint locally and queue the old base catalog, commit
+   objects through N, and old checkpoint blobs not shared by the new catalog
+   as known garbage. They remain charged until deletion is confirmed.
 
 The old base checkpoint and all absorbed commit objects remain live until step
 5 succeeds. A lost CAS response is resolved by reading the head. An aborted
@@ -987,9 +1008,10 @@ commit so it does not wait for unrelated later writes.
 Every journal region containing a selected record remains pinned until the
 commit attempt finishes or aborts.
 
-Ordinary segment objects are not assembled in RAM or copied into maintenance
-scratch. The commit descriptor fixes their record order and headers, then
-streams the pinned journal records once to compute exact lengths and checksums.
+Ordinary segment objects are not assembled in RAM or copied into the emergency
+repack scratch region. The commit descriptor fixes their record order and
+headers, then streams the pinned journal records once to compute exact lengths
+and checksums.
 After reservation, the uploader deterministically streams the same records
 again. Retries repeat that stream. Two uploads use bounded 1 MiB chunks while
 the commit descriptor remains in the 8 MiB remote-work arena; no
@@ -1013,14 +1035,16 @@ writer cache UUID and covered batch sequence
 mode: normal or maintenance
 used remote bytes and reserved remote bytes
 pending operation: none, commit number, checkpoint catalog, or GC descriptor
+GC phase when pending: deleting or accounted
 mode to install after success or abort
 checksum
 ```
 
 Every mutation uses exact ETag compare-and-swap. There is at most one pending
-operation. An ordinary commit returns to normal, a repacking commit and GC
-batch retain maintenance, and a checkpoint returns to normal whether it
-finishes or aborts.
+operation. An ordinary commit remains in normal mode. A checkpoint, deletion
+batch, or emergency repack enters maintenance for only that operation and
+returns to normal after it finishes or aborts. An orphan-audit LIST slice does
+not mutate the head or enter maintenance.
 
 ### 12.3 Commit object and publication
 
@@ -1028,9 +1052,11 @@ finishes or aborts.
 delta needed to advance the manifest from commit `N-1` to `N`. It contains:
 
 - volume UUID, writer token, cache UUID, commit N, and expected commit N-1;
+- operation kind: ordinary writeback or emergency repack;
 - expected head revision, base checkpoint, and cut sequence;
 - every new segment key, slot count, exact length, and checksum;
 - ordered logical-block runs assigning each new segment slot;
+- for a repack, the preceding segment and slot that supplies each new slot;
 - the exact remote-byte reservation and commit-object checksum.
 
 The object is limited to 4 MiB. If its encoded mapping runs would exceed that
@@ -1079,8 +1105,11 @@ publication.
 On attach, a pending commit is resolved before new remote work:
 
 - if the commit object and every segment validate, finish the final CAS;
-- otherwise resume missing segment uploads when the referenced journal records
+- otherwise resume an ordinary upload when the referenced journal records
   validate;
+- otherwise resume a repack upload from the descriptor's preceding immutable
+  slots after verifying that the pre-commit manifest still maps every logical
+  block to those slots;
 - or delete every object unique to the pending commit, confirm absence, and
   CAS the head back to the preceding commit in the pending operation's retained
   mode.
@@ -1148,7 +1177,8 @@ too small for the control allowance, reserve, and one maximum commit.
 
 Bytes remain counted after becoming unreachable. They are subtracted only
 after deletion is confirmed. A crash may therefore overcount space but must
-never undercount it.
+never undercount it. Retaining unreachable objects is intentional: age alone
+does not trigger deletion or segment rewriting.
 
 Reused checkpoint blobs add zero bytes only when already accounted. A
 checkpoint reservation may exclude a blob only when the object validates and
@@ -1165,98 +1195,191 @@ Committed delta objects remain in `used_bytes` until a checkpoint with
 Reaching either retained-delta limit forces checkpoint publication before
 another ordinary commit.
 
-## 14. Garbage collection and compaction
+## 14. Lazy remote reclamation
 
-Remote maintenance is intentionally serialized. Normal commits stop while the
-head is in `mode = maintenance`; local writes continue into the bounded
-journal.
+Remote garbage is a space cost, not a correctness emergency. DeepDisk retains
+it by default and keeps every retained byte in `used_bytes`. Ordinary reads,
+writes, commits, attach, and restore never require a collection pass.
 
-### 14.1 Crash-safe deletion batches
+Remote mutations remain serialized. A deletion batch or emergency repack
+briefly stops normal commits while the head is in `mode = maintenance`; local
+writes continue into the bounded journal. Namespace listing itself does not
+enter maintenance.
+
+### 14.1 Known garbage and reclamation policy
+
+DeepDisk can identify and normally records an exact garbage candidate when:
+
+- a segment's `live_slots` becomes zero; deletion still waits for reads that
+  selected it to drain;
+- a new checkpoint absorbs commit objects;
+- a new checkpoint replaces a catalog or checkpoint blob that it does not
+  share; or
+- pending-operation recovery conservatively accounts an otherwise unreachable
+  object instead of deleting it immediately.
+
+The `garbage` column family is an on-disk work queue. It is not loaded into
+RAM, is not part of read lookup, and is not trusted by itself for deletion.
+Candidate bytes remain included in `used_bytes`.
+
+DeepDisk does not reclaim because a candidate is old, because a low-live
+segment crosses a fixed ratio, or because a periodic timer fires. Automatic
+reclamation starts only when the next conservatively bounded ordinary commit
+would not fit below the maintenance reserve. It proceeds in this order:
+
+1. delete already-known whole-object garbage;
+2. perform or resume bounded orphan-audit slices if the known queue is
+   insufficient;
+3. repack the least-live segment only if deleting whole objects cannot admit
+   another ordinary commit.
+
+Reclamation stops as soon as one maximum ordinary commit fits again. An
+administrator may request any stage explicitly. If no safe operation can free
+enough space, remote writeback stops and the normal journal pacing and stall
+rules apply. DeepDisk never exceeds the quota to avoid throttling.
+
+### 14.2 Crash-safe deletion batches
 
 Remote quota is an aggregate counter, so deletion must be replayable. A GC
-descriptor is an immutable, checksummed list of at most 4 MiB:
+descriptor is an immutable, checksummed list of at most 4 MiB and at most 256
+objects:
 
 ```text
 volume UUID, writer token, GC ID, and expected head revision
-target object key and exact length
+target object key, object type, and exact length
 whether each target is currently included in used_bytes
 total accounted bytes to subtract
 ```
 
 A deletion batch is:
 
-1. Build the descriptor from a fixed maintenance view and write `gc/<id>` with
-   `If-None-Match: *`.
-2. CAS the maintenance head from no pending operation to that pending GC ID,
-   checksum, and byte total.
-3. Delete every target and confirm its absence by exact key.
-4. CAS the head to clear the pending operation and subtract exactly the
-   descriptor's accounted byte total.
-5. Delete the unaccounted GC descriptor and confirm its absence before starting
-   another operation.
+1. Require a normal head with no pending operation and local RocksDB applied
+   through `last_commit`. Revalidate every candidate against the current base
+   catalog, retained commit range, segment live count, read pins, and exact
+   object length.
+2. Write `gc/<id>` with `If-None-Match: *`.
+3. CAS the head directly from normal with no pending operation to maintenance
+   with that pending GC ID, checksum, byte total, and `phase = deleting`.
+4. Delete every target and confirm its absence by exact key.
+5. CAS the pending operation to `phase = accounted` and subtract exactly the
+   descriptor's accounted byte total. Keep the GC ID pending and remain in
+   maintenance.
+6. In one synced RocksDB batch, remove the completed `garbage` rows, remove
+   deleted zero-live `segments` rows, and record the installed head revision.
+7. Delete the unaccounted GC descriptor and confirm its absence before
+   starting another remote operation.
+8. CAS the head back to normal and clear the pending operation.
+
+An object already absent before step 3 is not placed in a new descriptor and
+creates no quota credit. With no pending operation, such an absence means that
+local cleanup of an earlier completed deletion was interrupted; the stale
+candidate may be removed locally. External deletion violates the single-writer
+backend contract.
 
 An unclaimed descriptor has caused no deletion and is safe to remove. A crash
-after step 2 resumes the exact list; a crash after target deletion but before
-step 4 repeats the deletes and performs the subtraction once. An ambiguous
-delete or CAS leaves the head pending and creates no quota credit. The control
-allowance admits at most one unaccounted commit or GC descriptor.
+after step 3 resumes the exact list; a crash after target deletion but before
+step 5 repeats the deletes and performs the subtraction once. A crash after
+step 5 observes `phase = accounted`, completes steps 6 through 8, and never
+subtracts again. An ambiguous delete or CAS leaves the operation pending and
+creates no quota credit. Keeping the GC ID pending until its descriptor is
+gone makes recovery independent of local scratch and preserves the one-object
+control allowance. If a crash follows step 7 and the local cache is also lost,
+descriptor absence is the expected completed state: recovery clears the
+pending head, and any stale restored candidate is later discarded when its
+target is confirmed absent without quota credit.
 
-Before any delete, recovery revalidates the descriptor checksum, writer token,
-canonical volume-relative keys, exact lengths, and the fixed live view. A
-descriptor may never target `meta/*`, itself, another pending operation, or a
-currently marked object.
+A descriptor may never target `meta/*`, itself, another pending operation, or
+an object reachable from the current base-and-delta chain. Maintenance is held
+only for this bounded batch, not for discovery of later candidates.
 
-### 14.2 Finding garbage
+### 14.3 Incremental orphan audit
 
-A collection pass:
+LIST is an audit and candidate-discovery mechanism, not part of routine
+reclamation. An audit starts only on explicit request, after cache or manifest
+restoration, after an accounting anomaly, or when quota pressure remains after
+the known-garbage queue is exhausted. Periodic audits are disabled by default.
+A restoration-triggered audit starts after attach completes and does not delay
+device availability.
 
-1. resolves any pending operation and removes unclaimed commit or GC
-   descriptors, which cannot have published data;
-2. CASes a normal head with no pending operation into maintenance;
-3. verifies that local RocksDB is applied through `last_commit`;
-4. marks `meta/super`, `meta/head`, the current base catalog and blobs, the
-   deterministic commit range, and every segment with nonzero `live_slots`;
-5. emits unmarked objects and zero-live segments through bounded deletion
-   batches;
-6. reconciles accounting and CASes the head back to normal.
+Each audit slice stops after 100,000 object records or after one second of
+slice wall time; an in-flight LIST request is allowed to complete. It stores
+the last returned key and bounded candidates on manifest disk, then yields to
+normal remote commits. It resumes with exclusive start-after rather than
+persisting a backend continuation token. It never retains the complete
+namespace or live set in RAM. Losing the local cursor restarts the cycle and is
+harmless.
 
-The `segments` column family is the data-object live set. Remote listing, its
-ordered records, the base catalog, and the numeric commit range are merged as
-streams through `maintenance_bytes`; the full mark or delete set is never held
-in RAM. No normal upload can create an object after the mark. A crash leaves
-maintenance ownership in the head and recovery resumes or restarts the pass.
+Under quota pressure, the next at-most-256 candidate records may go
+directly into a GC descriptor even when the best-effort `garbage` queue is
+full. All additional candidates are streamed to that queue or omitted. The
+queue cap therefore limits local metadata, not the ability to reclaim space
+from the current audit slice.
+Outside quota pressure, audit LISTs have the lowest remote-I/O priority and
+yield after the current page whenever a data commit is ready or the journal
+reaches its drain watermark.
 
-A missing `LIST` result can leak an object but cannot delete a live object:
-every proposed deletion is checked against the fixed live streams and by exact
-key. Listing is authority to discover candidates, never by itself authority to
-lower `used_bytes`. Duplicate results are harmless. Upward reconciliation uses
-the greater of the remote ledger and listed non-control bytes.
+The scan streams remote keys against:
 
-After a zero-live segment is deleted and its deletion batch is accounted, its
-local descriptor may be removed in a synced RocksDB batch. This cleanup needs
-no remote delta; replay may resurrect a harmless zero-live descriptor, and the
-next checkpoint absorbs its removal.
+- `meta/super`, `meta/head`, and the current pending operation;
+- the current base catalog and its blobs;
+- the deterministic retained commit range; and
+- the `segments` column family entries with nonzero `live_slots`.
 
-### 14.3 Segment repacking
+Every discovered candidate is revalidated under the current head by the
+deletion-batch protocol. Objects created while a cycle is in progress may sort
+before its cursor and wait for the next cycle; they are never deleted merely
+because the current cycle did not mark them. Duplicate or omitted LIST results
+can duplicate work or leak space but cannot delete a live object.
 
-Repacking selects a low-live segment, verifies every apparently live slot
-against the current extent lookup, and copies only exact matches. It publishes
-replacement mappings through a pending maintenance commit, advances the same
-contiguous commit number, and leaves the covered journal sequence unchanged.
-The old segment enters a deletion batch only after the commit is current,
-locally applied, and all reads that selected it have drained.
+LIST-derived byte totals are diagnostic. A candidate receives quota credit
+only when protocol provenance proves that its bytes are in `used_bytes`.
+With a normal head and no pending operation, every segment, catalog, and
+manifest blob created through the ownership protocol is accounted; an
+unclaimed commit or GC descriptor is not. Anything outside these cases is an
+invariant failure and is retained. LIST never directly changes a quota counter.
 
-One pass publishes at most one repacking commit and obeys the ordinary 4 MiB
-delta and retained-delta limits. If no delta capacity remains, the worker exits
-maintenance, checkpoints, and restarts. A sampled audit compares extent
-mappings with segment counters; repairing a mismatch requires a full offline
-audit.
+At 100 TB of live data in full 32 MiB segments, an audit sees roughly three
+million live segment objects before retained garbage, or roughly 3,000 LIST
+pages at 1,000 keys per page. Retaining another 100 TB of full-segment garbage
+roughly doubles that work; small metadata objects add to the object count.
+Audit cost therefore follows actual objects under the remote quota, not logical
+device size. It is metadata work rather than a read of their payloads and is
+spread across at least 30 default slices at the live-only scale.
 
-This stop-the-world remote design is a simplicity trade. A long pass can push
-the journal into pacing or stall. Maintenance starts manually, above 75% remote
-usage, when known garbage or low-live segments exceed 10% of data bytes, after
-a checkpoint leaves obsolete manifest objects, or at least every 30 active
-days.
+### 14.4 Emergency segment repacking
+
+There is no background live-ratio repacking threshold. Automatic repacking is
+allowed only when quota pressure remains after known whole-object deletion and
+an audit slice cannot produce enough reclaimable bytes. An administrator may
+also request it explicitly.
+
+Candidate selection scans at most 100,000 `segments` records from a persistent
+cursor and retains only the best record. It maintains no live-ratio heap or
+secondary index. If one slice finds no useful candidate, writeback remains
+throttled while a later slice resumes the scan.
+
+The worker verifies every apparently live slot of the selected segment against
+the current extent lookup and copies only exact matches into the fixed 64 MiB
+scratch region. It verifies and hashes the complete replacement there before
+upload; no segment-sized RAM buffer is allocated. Scratch is disposable and
+need not be flushed: before publication it can be rebuilt from the still-live
+old segment, and after publication the uploaded replacement is authoritative.
+The worker publishes replacement mappings through one pending maintenance
+commit, advances the contiguous commit number, and leaves the covered journal
+sequence unchanged. The old segment is queued for deletion only after the
+commit is current, locally applied, and all reads that selected it have
+drained.
+
+One operation repacks at most one segment and obeys the ordinary 4 MiB delta
+and retained-delta limits. It runs only when its replacement fits inside the
+maintenance reserve and stops once one maximum ordinary commit can fit. If no
+delta capacity remains, the worker returns to normal, checkpoints, and
+retries. If no eligible segment produces net free space, writeback remains
+throttled rather than rewriting nearly full objects.
+
+A sampled offline audit compares extent mappings with segment counters.
+Repairing a mismatch requires a full offline manifest audit; a counter mismatch
+is never repaired by trusting remote LIST results.
 
 ## 15. Ownership and fencing
 
@@ -1318,6 +1441,11 @@ deepdisk remote-sync
 deepdisk status
   Report ownership, pressure, coverage, quota, and recovery state.
 
+deepdisk remote-gc [--audit] [--repack]
+  Explicitly reclaim known whole-object garbage in bounded batches. --audit
+  requests a complete incremental namespace-audit cycle; --repack also permits
+  one-segment repacking without current quota pressure.
+
 deepdisk detach
   Stop new I/O, flush the local journal, and preserve any remotely dirty
   journal data.
@@ -1337,6 +1465,7 @@ journal is ahead of the remote head.
 fixed at volume creation
   block_bytes                  4096
   device_bytes                 fixed presented size
+  segment_data_bytes           32 MiB
   remote endpoint, bucket, prefix
   remote_limit_bytes           required hard quota
 
@@ -1349,7 +1478,7 @@ fixed at cache format
   journal_bloom_bits_per_record 16
   journal_footer_pending_regions 4
   journal_bytes                min(max(5% cache, 8 GiB), 16 GiB)
-  maintenance_bytes            min(max(0.5% cache, 1 GiB), 4 GiB)
+  repack_scratch_bytes          64 MiB
   clean associativity          16
 
 tunable at attach
@@ -1376,7 +1505,6 @@ remote writeback
   commit_max_mappings           65,536
   commit_object_max_bytes        4 MiB
   remote_age_target            10 s
-  segment_data_bytes           32 MiB
   upload_concurrency           2
   read_deadline                60 s
 
@@ -1395,19 +1523,26 @@ local manifest
   max_compaction_bytes           1 GiB input plus output
   manifest_emergency_bytes     max(1 GiB, 5% manifest quota)
   checkpoint_catalog_page_max_bytes 8 MiB
-  segment_repack_live_ratio    50%
+  garbage_queue_max_encoded_bytes  64 MiB
 
 remote quota
   maintenance_reserve          max(1 GiB, 5%), capped at 64 GiB
   control_allowance             32 MiB
   gc_descriptor_max_bytes        4 MiB
+  gc_delete_batch_max_objects      256
+  gc_audit_slice_max_objects    100,000
+  gc_audit_slice_max_seconds          1
+  gc_periodic_audit_interval    disabled
+  segment_repack_policy         quota-pressure-only
+  segment_repack_scan_max_records 100,000
 ```
 
 Attach reports the interpreted byte values and refuses inconsistent
 combinations. The configured journal directory must fit the derived Bloom
 directory, footer page directories, active exact index, and the maximum footer
 pipeline at worst-case 4 KiB records. Percentages are converted to bytes once;
-pressure calculations do not use a moving denominator.
+pressure calculations do not use a moving denominator. The maximum encoded
+segment object must fit completely in `repack_scratch_bytes`.
 
 ## 18. Observability
 
@@ -1525,7 +1660,7 @@ deepdisk_remote_corruption_total{type}
 deepdisk_manifest_extent_records
 deepdisk_manifest_segment_records
 deepdisk_manifest_seek_seconds
-deepdisk_manifest_disk_bytes{class=live|checkpoint|pending|temporary}
+deepdisk_manifest_disk_bytes{class=live|garbage|checkpoint|pending|temporary}
 deepdisk_manifest_disk_limit_bytes
 deepdisk_manifest_worst_case_blocks_remaining
 deepdisk_rocksdb_sst_files{level}
@@ -1551,13 +1686,24 @@ deepdisk_checkpoint_restore_seconds
 deepdisk_checkpoint_replay_commits_total
 deepdisk_checkpoint_replay_bytes_total
 deepdisk_checkpoint_replay_seconds
-deepdisk_gc_state{state}
-deepdisk_gc_mark_bytes
-deepdisk_gc_list_objects
-deepdisk_gc_deleted_objects
-deepdisk_gc_deleted_bytes
+deepdisk_gc_state{state=idle|audit|delete|repack|recover}
+deepdisk_gc_known_garbage_objects{type}
+deepdisk_gc_known_garbage_bytes{type}
+deepdisk_gc_queue_encoded_bytes
+deepdisk_gc_queue_encoded_limit_bytes
+deepdisk_gc_candidate_omitted_total{type,reason}
+deepdisk_gc_delete_batches_total{result}
+deepdisk_gc_deleted_objects_total{type}
+deepdisk_gc_deleted_bytes_total{type}
+deepdisk_gc_audit_cycles_total{result}
+deepdisk_gc_audit_slices_total{result}
+deepdisk_gc_audit_list_objects_total
+deepdisk_gc_audit_candidates_total{type}
+deepdisk_gc_audit_seconds
+deepdisk_gc_repack_total{result}
+deepdisk_gc_repack_bytes_total{direction}
+deepdisk_gc_repack_scan_records_total
 deepdisk_gc_segment_live_ratio
-deepdisk_gc_seconds
 ```
 
 ### 18.7 Quota, ownership, and resources
@@ -1568,6 +1714,7 @@ deepdisk_remote_reserved_bytes
 deepdisk_remote_limit_bytes
 deepdisk_remote_control_used_bytes
 deepdisk_remote_maintenance_reserve_bytes
+deepdisk_remote_normal_commit_headroom_bytes
 deepdisk_local_partition_bytes{class}
 deepdisk_manifest_quota_ratio
 deepdisk_process_rss_bytes
@@ -1589,7 +1736,8 @@ Structured events are emitted for:
 - local dirty corruption and remote corruption;
 - pending commit, checkpoint, and GC-batch recovery;
 - credential expiry and remote outage;
-- quota refusal and maintenance start, pause, resume, and completion;
+- quota refusal, deletion-batch maintenance, audit-cycle progress, and
+  emergency repacking;
 - any invariant failure that stops the device.
 
 ## 19. Correctness invariants
@@ -1618,20 +1766,28 @@ The implementation must continuously assert:
    validated immutable segment.
 9. No remote data segment is uploaded before a pending head reservation names
    its commit, checksum, and maximum bytes.
-10. Remote used bytes decrease only in the final CAS of a pending GC batch
-    whose exact targets are confirmed absent; ambiguous accounting may
-    overcount but never creates quota credit.
-11. Normal remote publication and garbage deletion never run concurrently.
-12. Segment `live_slots` equals the number of current extent slots that name
+10. Remote used bytes decrease only in the `deleting` to `accounted` CAS of a
+    pending GC batch whose exact targets are confirmed absent; ambiguous
+    accounting may overcount but never creates quota credit.
+11. A pending GC in `deleting` phase retains a valid descriptor; an
+    `accounted` phase never subtracts again and may clear only after that
+    descriptor is confirmed absent.
+12. Normal remote publication and garbage deletion or repacking never run
+    concurrently. LIST-only audit slices may overlap normal mode but cannot
+    mutate remote state.
+13. Every deletion target is revalidated against the current head, base,
+    retained commits, segment counts, and read pins after all earlier pending
+    operations resolve. A LIST result alone is never deletion authority.
+14. Segment `live_slots` equals the number of current extent slots that name
     that segment.
-13. Local RocksDB is never ahead of the remote head, and no later commit begins
+15. Local RocksDB is never ahead of the remote head, and no later commit begins
     while it is behind. An ordinary commit's changed blocks remain in the
     journal; a repacking commit's old segments remain readable and contain the
     same logical bytes.
-14. An old base checkpoint or absorbed commit is not deleted until the head
+16. An old base checkpoint or absorbed commit is not deleted until the head
     installs its replacement base; a segment selected by a read is not deleted
     or replaced until that read drains.
-15. A writer whose token no longer matches the head cannot publish.
+17. A writer whose token no longer matches the head cannot publish.
 
 An invariant failure stops new writes and preserves local evidence. It is not
 converted into a cache miss or retried indefinitely.
@@ -1696,17 +1852,28 @@ later CAS must fail.
 ### 20.3 Manifest and GC tests
 
 Random histories of writes, extent splits and merges, RocksDB compactions,
-commit aborts, checkpoint creation and restore, repacking, and garbage
-collection are compared to a simple in-memory block map. After every operation,
-per-segment live counts are recomputed independently.
+commit aborts, checkpoint creation and restore, lazy deletion, incremental
+audits, and emergency repacking are compared to a simple in-memory block map.
+After every operation, per-segment live counts are recomputed independently.
 
-The collector is tested with:
+Remote reclamation is tested with:
 
-- crashes during mark, repack, delete, and accounting;
-- duplicate and omitted `LIST` results;
+- garbage retained below quota pressure and still included in `used_bytes`;
+- a full local garbage queue omitting candidates without blocking commit
+  application, followed by audit rediscovery;
+- crashes during candidate enqueue, audit-cursor persistence, repack, delete,
+  final accounting CAS, local queue cleanup, and descriptor cleanup;
+- duplicate and omitted `LIST` results and objects created before and after the
+  saved cursor;
+- cursor loss and restart after every audit slice;
+- a listed object becoming live, pending, or read-pinned before deletion
+  revalidation;
+- normal commits between every pair of audit slices;
 - missing, truncated, substituted, and hash-mismatched checkpoint blobs;
 - a crash with a pending commit, checkpoint, or GC batch at every publication
   step;
+- cache and scratch loss during a pending repack, followed by verified rebuild
+  from its descriptor or safe abort to the preceding mappings;
 - a final head CAS immediately before local manifest-generation installation;
 - old-generation reads that outlive a manifest switch;
 - restore from a base followed by 0, 1, and 4096 deltas;
@@ -1716,7 +1883,12 @@ The collector is tested with:
   objects during replay;
 - manifest project-quota exhaustion during flush and compaction;
 - quota exhaustion with only maintenance reserve available;
-- a segment becoming completely dead and one remaining barely live.
+- known whole-object deletion admitting the next commit without repacking;
+- an exhausted known queue triggering one least-live repack and then stopping;
+- no eligible repack, causing writeback to remain throttled without exceeding
+  quota; and
+- a segment becoming completely dead and one remaining barely live, with
+  neither reclaimed before policy permits it.
 
 ### 20.4 Offline recovery tests
 
@@ -1765,6 +1937,14 @@ Before release:
   versus uploading the same data segments without metadata work;
 - checkpoint restore time and required local bytes are measured at every
   supported manifest scale;
+- below remote quota pressure, retained garbage causes no delete, LIST, or
+  segment-repack request on the write or read path;
+- three-million-object and garbage-amplified audits stay inside the configured
+  manifest and process-memory bounds, persist their cursor, and permit normal
+  commits between slices;
+- deletion-batch maintenance duration is measured under healthy, throttled,
+  timed-out, and ambiguous-response backends; a stuck batch remains
+  recoverable and journal pressure stays bounded;
 - default attach and every steady-state stress case remain below the 96 MiB
   worker-cgroup limit, including RocksDB native allocations and filesystem
   page cache charged to that cgroup;
@@ -1800,9 +1980,11 @@ The design spends complexity only where correctness requires it:
 - one mutable remote head serializing reservation and publication;
 - one conventional local metadata database;
 - one writer;
-- one stop-the-world collector.
+- one lazy on-disk garbage queue with bounded replayable deletion batches.
 
 There is no database running on object storage. RAM and clean-cache capacity
 are independent, and the default worker is hard-limited to 96 MiB. Manifest
 disk and disaster-recovery time scale with mapping fragmentation and are
-exposed as first-class costs.
+exposed as first-class costs. Unreachable remote objects remain quota-accounted
+until pressure or an explicit request justifies deletion. There is no
+full-volume maintenance pause and no routine segment rewriting.
